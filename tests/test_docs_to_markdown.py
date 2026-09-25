@@ -233,3 +233,40 @@ def test_footnotes_markdown_appends_definitions_in_reference_order():
 def test_footnotes_markdown_empty_without_references():
     body = make_body(("NORMAL_TEXT", "plain"))
     assert footnotes_markdown(body, {}, {}) == ""
+
+
+# ─── chips (docs_insert_chip's @-mentions, dates, rich links) ────────────
+
+
+def test_person_chip_renders_as_mention():
+    body = _footnote_para(
+        {"textRun": {"content": "Ping "}},
+        {"person": {"personProperties": {"name": "Ada Lovelace", "email": "ada@x.com"}}},
+        {"textRun": {"content": " about it.\n"}},
+    )
+    assert body_to_markdown(body, {}) == "Ping @Ada Lovelace <ada@x.com> about it."
+
+
+def test_person_chip_without_a_name_falls_back_to_email():
+    body = _footnote_para(
+        {"person": {"personProperties": {"email": "ada@x.com"}}},
+        {"textRun": {"content": "\n"}},
+    )
+    assert body_to_markdown(body, {}) == "ada@x.com"
+
+
+def test_richlink_chip_renders_as_markdown_link():
+    body = _footnote_para(
+        {"richLink": {"richLinkProperties": {"title": "Q3 Plan", "uri": "https://docs.google.com/x"}}},
+        {"textRun": {"content": "\n"}},
+    )
+    assert body_to_markdown(body, {}) == "[Q3 Plan](https://docs.google.com/x)"
+
+
+def test_date_chip_renders_its_displayed_text():
+    body = _footnote_para(
+        {"dateElement": {"dateElementProperties": {
+            "timestamp": "2026-09-25T00:00:00Z", "displayText": "Sep 25, 2026"}}},
+        {"textRun": {"content": "\n"}},
+    )
+    assert body_to_markdown(body, {}) == "Sep 25, 2026"

@@ -50,6 +50,8 @@ def flatten_tabs(doc: dict) -> list[dict]:
                 "headers": doc_tab.get("headers", {}),
                 "footers": doc_tab.get("footers", {}),
                 "footnotes": doc_tab.get("footnotes", {}),
+                "inline_objects": doc_tab.get("inlineObjects", {}),
+                "positioned_objects": doc_tab.get("positionedObjects", {}),
             })
             walk(t.get("childTabs", []), depth + 1)
 
@@ -62,6 +64,8 @@ def flatten_tabs(doc: dict) -> list[dict]:
             "headers": doc.get("headers", {}),
             "footers": doc.get("footers", {}),
             "footnotes": doc.get("footnotes", {}),
+            "inline_objects": doc.get("inlineObjects", {}),
+            "positioned_objects": doc.get("positionedObjects", {}),
         })
     return out
 
@@ -81,8 +85,39 @@ def resolve_tab(doc: dict, tab_id: str | None) -> dict:
 # ─── paragraphs & text ──────────────────────────────────────────────────
 
 
+def chip_text(e: dict) -> str | None:
+    """Display text for a person / richLink / dateElement paragraph element
+    (the "smart chips" docs_insert_chip creates), or None if `e` is none of
+    those. Used everywhere a paragraph's text is read back, so a chip shows
+    up as text instead of silently vanishing."""
+    if "person" in e:
+        props = e["person"].get("personProperties", {}) or {}
+        name, email = props.get("name"), props.get("email")
+        if name and email:
+            return f"@{name} <{email}>"
+        return email or name or ""
+    if "richLink" in e:
+        props = e["richLink"].get("richLinkProperties", {}) or {}
+        title, uri = props.get("title"), props.get("uri")
+        if uri:
+            return f"[{title or uri}]({uri})"
+        return title or ""
+    if "dateElement" in e:
+        props = e["dateElement"].get("dateElementProperties", {}) or {}
+        return props.get("displayText") or props.get("timestamp") or ""
+    return None
+
+
 def _para_text(p: dict) -> str:
-    return "".join(e.get("textRun", {}).get("content", "") for e in p.get("elements", []))
+    out = []
+    for e in p.get("elements", []):
+        if "textRun" in e:
+            out.append(e["textRun"].get("content", ""))
+        else:
+            chip = chip_text(e)
+            if chip is not None:
+                out.append(chip)
+    return "".join(out)
 
 
 def body_end(body: dict) -> int:
@@ -147,6 +182,10 @@ def text_runs(content: list[dict]) -> list[tuple[int, str]]:
             for e in el["paragraph"].get("elements", []):
                 if "textRun" in e:
                     runs.append((e.get("startIndex", 0), e["textRun"].get("content", "")))
+                else:
+                    chip = chip_text(e)
+                    if chip is not None:
+                        runs.append((e.get("startIndex", 0), chip))
         elif "table" in el:
             for row in el["table"].get("tableRows", []):
                 for cell in row.get("tableCells", []):
@@ -172,6 +211,10 @@ def plain_text_with_footnotes(content: list[dict]) -> str:
                     out.append(e["textRun"].get("content", ""))
                 elif "footnoteReference" in e:
                     out.append(f"[{e['footnoteReference'].get('footnoteNumber', '')}]")
+                else:
+                    chip = chip_text(e)
+                    if chip is not None:
+                        out.append(chip)
         elif "table" in el:
             for row in el["table"].get("tableRows", []):
                 for cell in row.get("tableCells", []):
@@ -375,3 +418,24 @@ def insertion_mode(body: dict, index: int) -> str:
     if any(p["start_index"] == index for p in paras):
         return "paragraph"
     return "inline"
+
+
+def find_inline_object(content: list[dict], object_id: str) -> tuple[int, int] | None:
+    """[start, end) of the paragraph element holding inline object
+    `object_id` — table cells included — the range docs_image's delete
+    passes to deleteContentRange. None if it isn't in `content` (a body's
+    or a table cell's `content` list)."""
+    for el in content:
+        if "paragraph" in el:
+            for e in el["paragraph"].get("elements", []):
+                if e.get("inlineObjectElement", {}).get("inlineObjectId") == object_id:
+                    # An inline object occupies exactly one index unit; fall
+                    # back to that when endIndex isn't present on the element.
+                    return e["startIndex"], e.get("endIndex", e["startIndex"] + 1)
+        elif "table" in el:
+            for row in el["table"].get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    found = find_inline_object(cell.get("content", []), object_id)
+                    if found:
+                        return found
+    return None

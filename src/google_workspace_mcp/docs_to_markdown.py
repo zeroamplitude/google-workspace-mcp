@@ -6,10 +6,12 @@ can re-ingest without losing structure. So this sticks to exactly the subset
 `docs_markdown` supports (see its module docstring) wherever the two need to
 agree — headings, bold/italic/code/links, bulleted/numbered lists (nested by
 two-space indent), and indented paragraphs as `> ` quotes. Tables, images,
-strikethrough and footnotes don't round-trip through `docs_markdown` (it has
-no writer for them); they're still rendered, as a GitHub pipe table,
-`![image](id)`, `~~text~~`, and a `[^N]` reference plus a trailing `[^N]:
-text` definition (see `footnotes_markdown`) respectively, for a human or
+strikethrough, footnotes and chips (docs_insert_chip's @-mentions, rich
+links and dates) don't round-trip through `docs_markdown` (it has no writer
+for them); they're still rendered, as a GitHub pipe table, `![image](id)`,
+`~~text~~`, a `[^N]` reference plus a trailing `[^N]: text` definition (see
+`footnotes_markdown`), and `@Name <email>` / `[title](uri)` / a date's own
+displayed text (see `docs_model.chip_text`) respectively, for a human or
 Claude to read.
 
 Every Doc paragraph becomes its own block, blank-line separated, except runs
@@ -87,6 +89,8 @@ def _raw_runs(elements: list[dict]) -> list[list]:
         elif "footnoteReference" in e:
             number = e["footnoteReference"].get("footnoteNumber", "")
             out.append([f"[^{number}]", {}, True])
+        elif (chip := docs_model.chip_text(e)) is not None:
+            out.append([chip, {}, True])
         # horizontalRule, columnBreak, ... : skipped
     if out and not out[-1][2] and out[-1][0].endswith("\n"):
         out[-1][0] = out[-1][0][:-1]

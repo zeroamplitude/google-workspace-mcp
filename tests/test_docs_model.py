@@ -93,6 +93,59 @@ def test_locate_quote_tolerates_whitespace_and_searches_tables():
     assert m.locate_quote(body, "absent") is None
 
 
+# ─── chips (docs_insert_chip's @-mentions, dates, rich links) ────────────
+
+
+def _chip_body(el: dict) -> dict:
+    """A one-paragraph body whose only element is `el` (plus its newline)."""
+    return {"content": [
+        {"endIndex": 1, "sectionBreak": {}},
+        {"startIndex": 1, "endIndex": 3, "paragraph": {"elements": [
+            el, {"startIndex": 2, "textRun": {"content": "\n"}},
+        ]}},
+    ]}
+
+
+def test_chip_text_renders_person_richlink_and_date():
+    person = {"person": {"personProperties": {"name": "Ada Lovelace", "email": "ada@x.com"}}}
+    assert m.chip_text(person) == "@Ada Lovelace <ada@x.com>"
+    assert m.chip_text({"person": {"personProperties": {"email": "ada@x.com"}}}) == "ada@x.com"
+    link = {"richLink": {"richLinkProperties": {"title": "Q3 Plan", "uri": "https://docs.google.com/x"}}}
+    assert m.chip_text(link) == "[Q3 Plan](https://docs.google.com/x)"
+    assert m.chip_text({"richLink": {"richLinkProperties": {"uri": "https://docs.google.com/x"}}}) == \
+        "[https://docs.google.com/x](https://docs.google.com/x)"
+    date = {"dateElement": {"dateElementProperties": {"displayText": "Sep 25, 2026", "timestamp": "2026-09-25T00:00:00Z"}}}
+    assert m.chip_text(date) == "Sep 25, 2026"
+    assert m.chip_text({"textRun": {"content": "plain"}}) is None
+
+
+def test_plain_text_and_para_text_render_chips_instead_of_dropping_them():
+    body = _chip_body({"startIndex": 1, "person": {"personProperties": {"name": "Ada", "email": "ada@x.com"}}})
+    assert m.plain_text(body) == "@Ada <ada@x.com>\n"
+    assert m.paragraphs(body)[0]["text"] == "@Ada <ada@x.com>"
+
+
+def test_locate_quote_sees_chip_text():
+    # chip_text renders as "[Budget](https://docs.google.com/y)"; the '['
+    # sits at the chip's own document index, "Budget" one char after it.
+    body = _chip_body({"startIndex": 1, "richLink": {"richLinkProperties": {
+        "title": "Budget", "uri": "https://docs.google.com/y"}}})
+    assert m.locate_quote(body, "Budget") == 2
+
+
+def test_find_inline_object_locates_element_range_in_body_and_table():
+    body = make_body(("image", "cap"))
+    got = m.find_inline_object(body["content"], "img")
+    assert got == (1, 2)
+    assert m.find_inline_object(body["content"], "nope") is None
+
+    table_body = make_body(("table", [["x"]]))
+    table_body["content"][1]["table"]["tableRows"][0]["tableCells"][0]["content"][0]["paragraph"]["elements"].append(
+        {"startIndex": 99, "endIndex": 100, "inlineObjectElement": {"inlineObjectId": "cell-img"}}
+    )
+    assert m.find_inline_object(table_body["content"], "cell-img") == (99, 100)
+
+
 def test_insertion_mode():
     body = make_body(("NORMAL_TEXT", "ab"), ("NORMAL_TEXT", "cd"))  # 1..4, 4..7, end 7
     assert m.insertion_mode(body, 4) == "paragraph"
