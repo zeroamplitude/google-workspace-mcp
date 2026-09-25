@@ -382,3 +382,20 @@ def test_table_edit_set_column_width_needs_a_positive_width(table_fake):
         server.docs_table_edit("personal", "doc-1", 0, "set_column_width", column=0)
     with pytest.raises(ValueError, match="needs a positive `width_pt`"):
         server.docs_table_edit("personal", "doc-1", 0, "set_column_width", column=0, width_pt=0)
+
+
+def test_table_edit_set_row_height(table_fake):
+    server.docs_table_edit("personal", "doc-1", 0, "set_row_height", row=1, row_height_pt=30)
+    assert table_fake.sent["requests"] == [{"updateTableRowStyle": {
+        "tableStartLocation": {"index": 6, "tabId": "t.0"},
+        "rowIndices": [1],
+        "tableRowStyle": {"minRowHeight": {"magnitude": 30, "unit": "PT"}},
+        "fields": "minRowHeight",
+    }}]
+
+
+def test_table_edit_set_row_height_needs_a_positive_height(table_fake):
+    with pytest.raises(ValueError, match="needs a positive `row_height_pt`"):
+        server.docs_table_edit("personal", "doc-1", 0, "set_row_height", row=0)
+    with pytest.raises(ValueError, match="needs a positive `row_height_pt`"):
+        server.docs_table_edit("personal", "doc-1", 0, "set_row_height", row=0, row_height_pt=0)

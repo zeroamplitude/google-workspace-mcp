@@ -179,3 +179,12 @@ def tasks(slug: str):
 
 def people(slug: str):
     return _service(slug, "people", "v1")
+
+
+def authorized_http(slug: str):
+    """The credentialed HTTP client backing a built service — refreshes
+    itself the same way `_service` does. For fetching a URL that has no
+    generated API method of its own (e.g. a Drive revision's exportLinks),
+    the same way drive_file_download's export_media()/get_media() do
+    internally."""
+    return drive(slug)._http

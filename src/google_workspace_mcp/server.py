@@ -1357,6 +1357,58 @@ def drive_file_link_access(
     return {"file_id": file_id, "link_access": "off"}
 
 
+_REVISION_FIELDS = "id, modifiedTime, lastModifyingUser(displayName, emailAddress), keepForever, exportLinks"
+
+
+@mcp.tool()
+def drive_revision_list(account: AccountSlug, file_id: str, page_size: int = 50) -> dict:
+    """List a file's revision history: `id`, `modifiedTime`, who last
+    modified it, `keepForever` (pinned so Drive won't auto-purge it), and
+    (for a Google Doc/Sheet/Slides) `exportLinks` — a mimeType -> URL map;
+    pass one of those mime types as drive_revision_get's `export_mime_type`
+    to fetch that revision's content. A binary (uploaded) file's revisions
+    have no exportLinks and are pruned after 30 days / 100 revisions unless
+    `keepForever`; a Google Docs Editors file keeps its full history.
+    """
+    resp = (
+        auth.drive(account)
+        .revisions()
+        .list(fileId=file_id, pageSize=page_size, fields=f"nextPageToken, revisions({_REVISION_FIELDS})")
+        .execute()
+    )
+    return {"revisions": resp.get("revisions", []), "next_page_token": resp.get("nextPageToken")}
+
+
+@mcp.tool()
+def drive_revision_get(
+    account: AccountSlug,
+    file_id: str,
+    revision_id: str,
+    export_mime_type: str = "text/plain",
+) -> dict:
+    """Get one revision's metadata (as drive_revision_list's rows), plus its
+    content for a Google Doc/Sheet/Slides revision — downloaded from its
+    `exportLinks[export_mime_type]` (default 'text/plain'; see
+    drive_revision_list for what mime types a revision offers). Binary file
+    revisions have no export link, so `content` is omitted for those; for a
+    binary file's current content use drive_file_download instead (Drive
+    doesn't address old binary revisions by content, only by metadata).
+    """
+    svc = auth.drive(account)
+    meta = svc.revisions().get(fileId=file_id, revisionId=revision_id, fields=_REVISION_FIELDS).execute()
+    url = (meta.get("exportLinks") or {}).get(export_mime_type)
+    if not url:
+        return meta
+    resp, content = auth.authorized_http(account).request(url)
+    if resp.status != 200:
+        raise ValueError(f"Downloading revision {revision_id} as {export_mime_type!r} failed (HTTP {resp.status}).")
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return {**meta, "content_base64": base64.b64encode(content).decode("ascii")}
+    return {**meta, "content": text}
+
+
 # Comments live on the Drive file, so these work on any file type. For a
 # Google Doc, each comment is also tagged with the section (heading path) its
 # quoted text falls in, found by locating the quote in the document.
@@ -1710,6 +1762,19 @@ def _insert_pagebreak_segment(
     return out.get("revision_id"), out
 
 
+def _insert_sectionbreak_segment(
+    account: str, document_id: str, idx: int, section_type: str, tab_id: str | None, revision: str | None
+) -> tuple[str | None, dict]:
+    """Insert one section break at `idx`. Returns (new revision, the batch
+    result). Google inserts a newline of its own right before the break, so
+    (like a table or a page break) the caller's index bookkeeping just
+    treats this as one opaque segment and re-fetches afterwards."""
+    loc = {"index": idx, **({"tabId": tab_id} if tab_id else {})}
+    req = {"insertSectionBreak": {"sectionType": section_type, "location": loc}}
+    out = _docs_batch(account, document_id, [req], revision)
+    return out.get("revision_id"), out
+
+
 def _insert_markdown(account: str, document_id: str, markdown: str, idx: int, mode: str, tab: dict, revision: str | None) -> dict:
     """Insert `markdown` at `idx`, handling any GitHub pipe tables or page
     breaks in it.
@@ -1739,8 +1804,10 @@ def _insert_markdown(account: str, document_id: str, markdown: str, idx: int, mo
             last_out = _docs_batch(account, document_id, reqs, revision)
         elif kind == "table":
             _, _, last_out = _insert_table_segment(account, document_id, payload, idx, mode, tab_id, revision)
-        else:  # "pagebreak"
+        elif kind == "pagebreak":
             _, last_out = _insert_pagebreak_segment(account, document_id, idx, tab_id, revision)
+        else:  # "sectionbreak"
+            _, last_out = _insert_sectionbreak_segment(account, document_id, idx, payload, tab_id, revision)
         _, fresh, revision = _docs_load(account, document_id, tab_id, None)
         idx = docs_model.body_end(fresh["body"]) - tail
         mode = docs_model.insertion_mode(fresh["body"], idx)
@@ -1929,8 +1996,11 @@ def docs_insert(
     - [ ] / - [x] checklists, ``` code blocks, > quotes (an indented
     paragraph), GitHub-style pipe tables (a `| a | b |` header, a
     `|---|---|` separator row, then data rows; the header row is bolded),
-    and a standalone `<!-- pagebreak -->` line for a page break. Anything
-    else is inserted as literal text.
+    a standalone `<!-- pagebreak -->` line for a page break, and a
+    standalone `<!-- sectionbreak -->` line for a section break starting on
+    the next page (`<!-- sectionbreak continuous -->` for one starting right
+    where the last left off — see docs_page_setup for styling a section).
+    Anything else is inserted as literal text.
     """
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
@@ -2500,9 +2570,10 @@ def docs_image(
 _TABLE_ACTIONS = (
     "insert_row", "insert_column", "delete_row", "delete_column", "set_cell",
     "merge_cells", "unmerge_cells", "style_cell", "pin_header_rows", "set_column_width",
+    "set_row_height",
 )
 _NEEDS_ROW = {"insert_row", "insert_column", "delete_row", "delete_column", "set_cell",
-              "merge_cells", "unmerge_cells", "style_cell"}
+              "merge_cells", "unmerge_cells", "style_cell", "set_row_height"}
 _NEEDS_COLUMN = {"set_cell", "insert_column", "delete_column",
                   "merge_cells", "unmerge_cells", "style_cell", "set_column_width"}
 
@@ -2523,6 +2594,7 @@ def docs_table_edit(
     background_color: str | None = None,
     count: int | None = None,
     width_pt: float | None = None,
+    row_height_pt: float | None = None,
     tab_id: str | None = None,
     revision_id: str | None = None,
 ) -> dict:
@@ -2553,6 +2625,8 @@ def docs_table_edit(
       repeating header rows; `count=0` unpins.
     - "set_column_width": sets `column`'s width to `width_pt` points
       (required), fixed rather than auto-sized.
+    - "set_row_height": sets `row`'s minimum height to `row_height_pt`
+      points (required); the row still grows to fit taller content.
     """
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
@@ -2632,6 +2706,17 @@ def docs_table_edit(
         }}
         return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, [req], revision)}
 
+    if action == "set_row_height":
+        if row_height_pt is None or row_height_pt <= 0:
+            raise ValueError('action="set_row_height" needs a positive `row_height_pt`.')
+        req = {"updateTableRowStyle": {
+            "tableStartLocation": table_start,
+            "rowIndices": [row],
+            "tableRowStyle": {"minRowHeight": _dim(row_height_pt)},
+            "fields": "minRowHeight",
+        }}
+        return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, [req], revision)}
+
     cell_loc = {"tableStartLocation": table_start, "rowIndex": row, "columnIndex": column}
     if action == "insert_row":
         req = {"insertTableRow": {"tableCellLocation": cell_loc, "insertBelow": below}}
@@ -2701,6 +2786,129 @@ def docs_header_footer(
     reqs = docs_markdown.markdown_to_requests(text, 0, "end_empty", loc_tab, hf_id)
     out2 = _docs_batch(account, document_id, reqs, out1.get("revision_id"))
     return {"kind": kind, "action": action, f"{kind}_id": hf_id, **out2}
+
+
+# ─── page setup ─────────────────────────────────────────────────────────
+
+_PAGE_PRESETS = {  # (width, height) in points
+    "letter": (612.0, 792.0),
+    "a4": (595.3, 841.9),
+    "legal": (612.0, 1008.0),
+}
+
+
+def _dim(magnitude: float) -> dict:
+    return {"magnitude": magnitude, "unit": "PT"}
+
+
+def _margin_fields(
+    style: dict[str, Any],
+    fields: list[str],
+    top: float | None,
+    bottom: float | None,
+    left: float | None,
+    right: float | None,
+) -> None:
+    for name, pt in (("marginTop", top), ("marginBottom", bottom), ("marginLeft", left), ("marginRight", right)):
+        if pt is not None:
+            style[name] = _dim(pt)
+            fields.append(name)
+
+
+@mcp.tool()
+def docs_page_setup(
+    account: AccountSlug,
+    document_id: str,
+    preset: Literal["letter", "a4", "legal"] | None = None,
+    width_pt: float | None = None,
+    height_pt: float | None = None,
+    orientation: Literal["portrait", "landscape"] | None = None,
+    margin_top_pt: float | None = None,
+    margin_bottom_pt: float | None = None,
+    margin_left_pt: float | None = None,
+    margin_right_pt: float | None = None,
+    background_color: str | None = None,
+    section_index: int | None = None,
+    column_count: int | None = None,
+    column_spacing_pt: float | None = None,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Set a Google Doc's page layout, in place. Only the params given are
+    changed; everything else is left as is.
+
+    Document-level (default, no `section_index`): `preset` ("letter" / "a4"
+    / "legal") or explicit `width_pt` / `height_pt` sets the page size
+    (giving only one of those falls back to the document's current other
+    dimension). `orientation` sets `flipPageOrientation` rather than
+    swapping width/height itself, so it composes with whatever the size is —
+    "landscape" flips a portrait-sized page and vice versa.
+    `margin_top_pt` / `margin_bottom_pt` / `margin_left_pt` /
+    `margin_right_pt` set the page margins, and `background_color` (hex,
+    like '#f5f5f5') the page background.
+
+    Section-level: pass `section_index` (0-based; a document starts with one
+    section, and gains another per `<!-- sectionbreak -->` in docs_insert)
+    to style that section instead, via updateSectionStyle: the same
+    `margin_*_pt` params, plus `column_count` (1-3) — with
+    `column_spacing_pt` for the gap between columns — for a multi-column
+    layout. `preset` / `width_pt` / `height_pt` / `orientation` /
+    `background_color` are document-wide only; pass those without
+    `section_index`.
+    """
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    loc_tab = tab["tab_id"]
+
+    if section_index is not None:
+        secs = docs_model.sections(tab["body"])
+        if not 0 <= section_index < len(secs):
+            raise ValueError(f"No section at section_index {section_index}; this tab has {len(secs)} section(s).")
+        sec = secs[section_index]
+        style: dict[str, Any] = {}
+        fields: list[str] = []
+        _margin_fields(style, fields, margin_top_pt, margin_bottom_pt, margin_left_pt, margin_right_pt)
+        if column_count is not None:
+            if not 1 <= column_count <= 3:
+                raise ValueError(f"column_count must be 1-3, got {column_count}.")
+            col: dict[str, Any] = {"paddingEnd": _dim(column_spacing_pt)} if column_spacing_pt is not None else {}
+            style["columnProperties"] = [dict(col) for _ in range(column_count)]
+            fields.append("columnProperties")
+        if not fields:
+            raise ValueError("Nothing to change: pass margin_*_pt and/or column_count with section_index.")
+        rng = {"startIndex": sec["start_index"], "endIndex": sec["end_index"], **({"tabId": loc_tab} if loc_tab else {})}
+        req = {"updateSectionStyle": {"range": rng, "sectionStyle": style, "fields": ",".join(fields)}}
+        return {"section_index": section_index, **_docs_batch(account, document_id, [req], revision)}
+
+    style = {}
+    fields = []
+    if preset or width_pt is not None or height_pt is not None:
+        w, h = _PAGE_PRESETS[preset] if preset else (None, None)
+        current = tab["style"].get("pageSize", {})
+        if width_pt is not None:
+            w = width_pt
+        elif w is None:
+            w = (current.get("width") or {}).get("magnitude")
+        if height_pt is not None:
+            h = height_pt
+        elif h is None:
+            h = (current.get("height") or {}).get("magnitude")
+        if w is None or h is None:
+            raise ValueError("Need both a width and a height: pass preset, or width_pt/height_pt for whichever the document doesn't already have.")
+        style["pageSize"] = {"width": _dim(w), "height": _dim(h)}
+        fields.append("pageSize")
+    if orientation is not None:
+        style["flipPageOrientation"] = orientation == "landscape"
+        fields.append("flipPageOrientation")
+    _margin_fields(style, fields, margin_top_pt, margin_bottom_pt, margin_left_pt, margin_right_pt)
+    if background_color:
+        style["background"] = {"color": _rgb(background_color)}
+        fields.append("background")
+    if not fields:
+        raise ValueError("Nothing to change: pass at least one page-setup param.")
+    req = {"updateDocumentStyle": {"documentStyle": style, "fields": ",".join(fields)}}
+    if loc_tab:
+        req["updateDocumentStyle"]["tabId"] = loc_tab
+    return _docs_batch(account, document_id, [req], revision)
 
 
 @mcp.tool()
