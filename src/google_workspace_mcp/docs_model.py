@@ -94,6 +94,38 @@ def paragraphs(body: dict) -> list[dict]:
     return out
 
 
+def tables(body: dict) -> list[dict]:
+    """Top-level tables (not nested inside another table), with cell ranges.
+
+    A cell's `start_index` is where text inserted there lands (the start of
+    its first paragraph); `end_index` is the end of its content, its own
+    final newline included — the range docs_table_edit's set_cell clears.
+    """
+    out = []
+    for el in body.get("content", []):
+        t = el.get("table")
+        if t is None:
+            continue
+        rows_out = []
+        for row in t.get("tableRows", []):
+            cells_out = []
+            for cell in row.get("tableCells", []):
+                content = cell.get("content", [])
+                start = content[0]["startIndex"] if content else el["startIndex"]
+                end = content[-1]["endIndex"] if content else start
+                text = "".join(txt for _, txt in text_runs(content))
+                cells_out.append({"start_index": start, "end_index": end, "text": text.rstrip("\n")})
+            rows_out.append(cells_out)
+        out.append({
+            "start_index": el.get("startIndex", 0),
+            "end_index": el["endIndex"],
+            "rows": len(rows_out),
+            "columns": len(rows_out[0]) if rows_out else 0,
+            "cells": rows_out,
+        })
+    return out
+
+
 def text_runs(content: list[dict]) -> list[tuple[int, str]]:
     """(start index, text) for every text run, table cells included."""
     runs: list[tuple[int, str]] = []

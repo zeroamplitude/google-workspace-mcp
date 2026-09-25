@@ -1560,6 +1560,100 @@ def _insert_index(body: dict, at: str, heading: str | None, index: int | None) -
     return index
 
 
+# insertTable only creates an empty grid; there's no way to seed cell text
+# in the same request. So a table goes in two batchUpdates: insertTable,
+# then a re-fetch to find where the table actually landed (it may have
+# pushed a newline in ahead of it) and fill its cells by index.
+def _fill_table(account: str, document_id: str, table: dict, rows: list[list[str]], tab_id: str | None, revision: str | None) -> dict:
+    """Fill a freshly-inserted (all-empty) table's cells with `rows`.
+
+    Cells are filled in reverse document order so that inserting into one
+    cell never shifts the start index of a cell still to be filled. The
+    header row (rows[0]) is bolded.
+    """
+    order = [
+        (cell["start_index"], r, c)
+        for r, row_cells in enumerate(table["cells"])
+        for c, cell in enumerate(row_cells)
+    ]
+    order.sort(key=lambda x: x[0], reverse=True)
+
+    reqs: list[dict] = []
+    for start, r, c in order:
+        if r >= len(rows) or c >= len(rows[r]) or not rows[r][c]:
+            continue
+        runs = docs_markdown.parse_inline(rows[r][c])
+        text = "".join(t for t, _ in runs)
+        loc = {"index": start, **({"tabId": tab_id} if tab_id else {})}
+        reqs.append({"insertText": {"text": text, "location": loc}})
+        pos = start
+        for t, style in runs:
+            n = docs_model.utf16_len(t)
+            if style:
+                rng = {"startIndex": pos, "endIndex": pos + n, **({"tabId": tab_id} if tab_id else {})}
+                reqs.append({"updateTextStyle": {"range": rng, "textStyle": style, "fields": ",".join(style)}})
+            pos += n
+        if r == 0:
+            rng = {"startIndex": start, "endIndex": start + docs_model.utf16_len(text), **({"tabId": tab_id} if tab_id else {})}
+            reqs.append({"updateTextStyle": {"range": rng, "textStyle": {"bold": True}, "fields": "bold"}})
+    if not reqs:
+        return {"document_id": document_id, "revision_id": revision, "requests_applied": 0, "replies": []}
+    return _docs_batch(account, document_id, reqs, revision)
+
+
+def _insert_table_segment(
+    account: str, document_id: str, rows: list[list[str]], idx: int, mode: str, tab_id: str | None, revision: str | None
+) -> tuple[int, str | None, dict]:
+    """Insert one Markdown table at `idx`. Returns (index after the table,
+    new revision, the batch result of the cell fill)."""
+    loc = {"index": idx, **({"tabId": tab_id} if tab_id else {})}
+    reqs: list[dict] = []
+    tbl_at = idx
+    if mode == "end":  # the last paragraph has text; a table needs one of its own
+        reqs.append({"insertText": {"text": "\n", "location": loc}})
+        tbl_at = idx + 1
+        loc = {"index": tbl_at, **({"tabId": tab_id} if tab_id else {})}
+    reqs.append({"insertTable": {"rows": len(rows), "columns": len(rows[0]) if rows else 0, "location": loc}})
+    _docs_batch(account, document_id, reqs, revision)
+
+    _, tab2, revision2 = _docs_load(account, document_id, tab_id, None)
+    table = next((t for t in docs_model.tables(tab2["body"]) if t["start_index"] >= tbl_at), None)
+    if table is None:
+        raise ValueError("Inserted a table but could not find it again after re-fetching the document.")
+    out2 = _fill_table(account, document_id, table, rows, tab_id, revision2)
+    return table["end_index"], out2.get("revision_id", revision2), out2
+
+
+def _insert_markdown(account: str, document_id: str, markdown: str, idx: int, mode: str, tab: dict, revision: str | None) -> dict:
+    """Insert `markdown` at `idx`, handling any GitHub pipe tables in it.
+
+    Markdown with no table is a single insert, exactly as before. Markdown
+    with one or more tables is applied segment by segment (text, then each
+    table, then more text, ...), each later segment landing right after the
+    one before it.
+    """
+    tab_id = tab["tab_id"]
+    segments = docs_markdown.split_markdown_tables(markdown)
+    if not any(kind == "table" for kind, _ in segments):
+        reqs = docs_markdown.markdown_to_requests(markdown, idx, mode, tab_id)
+        return {"inserted_at": idx, **_docs_batch(account, document_id, reqs, revision)}
+
+    first_idx = idx
+    last_out: dict = {}
+    for kind, payload in segments:
+        if kind == "text":
+            if not payload.strip():
+                continue
+            reqs = docs_markdown.markdown_to_requests(payload, idx, mode, tab_id)
+            last_out = _docs_batch(account, document_id, reqs, revision)
+            revision = last_out["revision_id"]
+            idx += docs_model.utf16_len(reqs[0]["insertText"]["text"])
+        else:
+            idx, revision, last_out = _insert_table_segment(account, document_id, payload, idx, mode, tab_id, revision)
+        mode = "paragraph"
+    return {"inserted_at": first_idx, **last_out}
+
+
 @mcp.tool()
 def docs_get(
     account: AccountSlug,
@@ -1570,8 +1664,10 @@ def docs_get(
     """Read a Google Doc for editing: its text, tabs, and heading outline.
 
     Returns `revision_id` (pass it to the edit tools so they refuse to write
-    over a newer version), `tabs`, the chosen tab's `text`, and `outline` —
-    every heading with its `level` (0 = Title, 1-6), `start_index`,
+    over a newer version), `tabs`, the chosen tab's `text`, `outline`, and
+    `tables` — every top-level table with its `rows`, `columns` and per-cell
+    `text`/index ranges, for docs_table_edit's `table_index` (its position
+    in this list). Outline entries: `level` (0 = Title, 1-6), `start_index`,
     `body_start_index` and `end_index` (the section's extent, subsections
     included). `include_paragraphs` adds every top-level paragraph with its
     index range, for exact edits with docs_delete_range / docs_insert(index=).
@@ -1590,6 +1686,7 @@ def docs_get(
         ],
         "body_end_index": docs_model.body_end(body),
         "outline": [s.as_dict() for s in docs_model.outline(body)],
+        "tables": docs_model.tables(body),
         "text": docs_model.plain_text(body),
     }
     if include_paragraphs:
@@ -1617,15 +1714,16 @@ def docs_insert(
 
     Markdown supported: # headings, paragraphs, **bold**, *italic*, `code`,
     [links](url), - bullets, 1. numbered lists (indent 2 spaces to nest),
-    ``` code blocks, > quotes (an indented paragraph). Anything else is
-    inserted as literal text.
+    ``` code blocks, > quotes (an indented paragraph), and GitHub-style pipe
+    tables (a `| a | b |` header, a `|---|---|` separator row, then data
+    rows; the header row is bolded). Anything else is inserted as literal
+    text.
     """
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
     idx = _insert_index(body, at, heading, index)
     mode = docs_model.insertion_mode(body, idx)
-    reqs = docs_markdown.markdown_to_requests(markdown, idx, mode, tab["tab_id"])
-    return {"inserted_at": idx, **_docs_batch(account, document_id, reqs, revision)}
+    return _insert_markdown(account, document_id, markdown, idx, mode, tab, revision)
 
 
 @mcp.tool()
@@ -1644,11 +1742,13 @@ def docs_replace_section(
     higher level, so its subsections are replaced too. `keep_heading=False`
     replaces the heading line as well (include a new # heading in `markdown`
     to rename it). The heading must match exactly one heading (case and
-    spacing ignored). Refuses a section holding a table, image, table of
-    contents or section break — remove those deliberately with
-    docs_delete_range, or edit around them with docs_replace_text /
-    docs_insert. Comments anchored to the replaced text lose their anchor.
-    Markdown support is as for docs_insert.
+    spacing ignored). A table inside the section is deleted along with the
+    rest of it (use docs_table_edit to change a table without replacing its
+    section). Refuses a section holding an image, table of contents or
+    section break — remove those deliberately with docs_delete_range, or
+    edit around them with docs_replace_text / docs_insert. Comments anchored
+    to the replaced text lose their anchor. Markdown support is as for
+    docs_insert.
     """
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
@@ -1661,7 +1761,7 @@ def docs_replace_section(
     reqs: list[dict] = []
     if stop > start:
         blocker = docs_model.structural_in_range(body, start, stop)
-        if blocker:
+        if blocker and blocker != "table":
             raise ValueError(
                 f"The section {section.heading!r} contains a {blocker}; replacing it would delete that too. "
                 "Use docs_delete_range to remove it deliberately, or docs_replace_text / docs_insert instead."
@@ -1673,12 +1773,20 @@ def docs_replace_section(
         idx, mode = start, ("end_empty" if stop == end - 1 else "paragraph")
     else:  # empty section and the heading is the tab's last paragraph
         idx, mode = end - 1, "end"
-    reqs += docs_markdown.markdown_to_requests(markdown, idx, mode, loc_tab)
-    return {
-        "section": section.heading,
-        "replaced_range": [start, stop],
-        **_docs_batch(account, document_id, reqs, revision),
-    }
+
+    segments = docs_markdown.split_markdown_tables(markdown)
+    if not any(kind == "table" for kind, _ in segments):
+        reqs += docs_markdown.markdown_to_requests(markdown, idx, mode, loc_tab)
+        return {
+            "section": section.heading,
+            "replaced_range": [start, stop],
+            **_docs_batch(account, document_id, reqs, revision),
+        }
+
+    if reqs:  # the delete goes first, on its own, then the segments follow it
+        revision = _docs_batch(account, document_id, reqs, revision)["revision_id"]
+    result = _insert_markdown(account, document_id, markdown, idx, mode, tab, revision)
+    return {"section": section.heading, "replaced_range": [start, stop], **result}
 
 
 @mcp.tool()
@@ -1924,6 +2032,90 @@ def docs_insert_image(
             files.update(fileId=up["id"], body={"trashed": True}).execute()
     reply = next((r["insertInlineImage"] for r in out["replies"] if r.get("insertInlineImage")), {})
     return {"inserted_at": img_at, "object_id": reply.get("objectId"), **out}
+
+
+@mcp.tool()
+def docs_table_edit(
+    account: AccountSlug,
+    document_id: str,
+    table_index: int,
+    action: Literal["insert_row", "insert_column", "delete_row", "delete_column", "set_cell"],
+    row: int,
+    column: int = 0,
+    text: str | None = None,
+    below: bool = True,
+    right: bool = True,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Add, remove, or edit a row/column/cell of a table already in a Google
+    Doc, in place. Use docs_insert / docs_replace_section (a Markdown pipe
+    table) to create a table in the first place; use this to change one
+    afterwards without rewriting the section around it.
+
+    `table_index` is the table's position (0-based) among docs_get's
+    `tables` for this tab — call docs_get first to find it and its current
+    row/column counts. `row` / `column` (0-based) name the cell the action
+    is anchored to:
+    - "insert_row": a new blank row next to `row` — below it, or above with
+      `below=False`.
+    - "insert_column": a new blank column next to `column` — right of it, or
+      left with `right=False`.
+    - "delete_row" / "delete_column": removes that row / column.
+    - "set_cell": replaces cell (`row`, `column`)'s text with `text`
+      (required for this action; supports the same inline **bold**/*italic*/
+      `code`/[link](url) markdown as docs_insert).
+    """
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    tables = docs_model.tables(body)
+    if not 0 <= table_index < len(tables):
+        raise ValueError(f"No table at table_index {table_index}; this tab has {len(tables)} table(s).")
+    table = tables[table_index]
+    loc_tab = tab["tab_id"]
+
+    if not 0 <= row < table["rows"]:
+        raise ValueError(f"row must be between 0 and {table['rows'] - 1} for this table, got {row}.")
+    if action in ("set_cell", "insert_column", "delete_column") and not 0 <= column < table["columns"]:
+        raise ValueError(f"column must be between 0 and {table['columns'] - 1} for this table, got {column}.")
+
+    if action == "set_cell":
+        if text is None:
+            raise ValueError('action="set_cell" needs `text`.')
+        cell = table["cells"][row][column]
+        reqs: list[dict] = []
+        if cell["end_index"] - 1 > cell["start_index"]:  # clear the existing content, its final newline kept
+            rng = {"startIndex": cell["start_index"], "endIndex": cell["end_index"] - 1}
+            if loc_tab:
+                rng["tabId"] = loc_tab
+            reqs.append({"deleteContentRange": {"range": rng}})
+        runs = docs_markdown.parse_inline(text)
+        full = "".join(t for t, _ in runs)
+        loc = {"index": cell["start_index"], **({"tabId": loc_tab} if loc_tab else {})}
+        reqs.append({"insertText": {"text": full, "location": loc}})
+        pos = cell["start_index"]
+        for t, style in runs:
+            n = docs_model.utf16_len(t)
+            if style:
+                rng = {"startIndex": pos, "endIndex": pos + n, **({"tabId": loc_tab} if loc_tab else {})}
+                reqs.append({"updateTextStyle": {"range": rng, "textStyle": style, "fields": ",".join(style)}})
+            pos += n
+        return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, reqs, revision)}
+
+    cell_loc = {
+        "tableStartLocation": {"index": table["start_index"], **({"tabId": loc_tab} if loc_tab else {})},
+        "rowIndex": row,
+        "columnIndex": column,
+    }
+    if action == "insert_row":
+        req = {"insertTableRow": {"tableCellLocation": cell_loc, "insertBelow": below}}
+    elif action == "insert_column":
+        req = {"insertTableColumn": {"tableCellLocation": cell_loc, "insertRight": right}}
+    elif action == "delete_row":
+        req = {"deleteTableRow": {"tableCellLocation": cell_loc}}
+    else:
+        req = {"deleteTableColumn": {"tableCellLocation": cell_loc}}
+    return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, [req], revision)}
 
 
 # ─── Tasks (Google Tasks) ────────────────────────────────────────────────
