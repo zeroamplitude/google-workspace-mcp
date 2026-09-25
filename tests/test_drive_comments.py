@@ -58,7 +58,8 @@ class _FakeDrive:
         return _Call(self.log, "files.get", resp={"mimeType": self.mime}, **kw)
 
     def create(self, **kw):
-        return _Call(self.log, "replies.create", resp={"id": "r-new", **kw["body"]}, **kw)
+        prefix = "c" if self._res == "comments" else "r"
+        return _Call(self.log, f"{self._res}.create", resp={"id": f"{prefix}-new", **kw["body"]}, **kw)
 
 
 class _FakeDocs:
@@ -150,3 +151,41 @@ def test_reply_and_resolve_bodies(wire):
     assert drive.log[-1][1]["body"] == {"action": "resolve"}
     server.drive_comment_resolve("personal", "doc-1", "c1", resolved=False, content="Reopening")
     assert drive.log[-1][1]["body"] == {"action": "reopen", "content": "Reopening"}
+
+
+def test_create_without_quote_posts_plain_comment_and_tags_no_section(wire):
+    drive = wire([])
+    row = server.drive_comment_create("personal", "doc-1", "New comment")
+    assert [n for n, _ in drive.log] == ["files.get", "comments.create"]
+    _, kw = drive.log[-1]
+    assert kw["body"] == {"content": "New comment"}
+    assert row["content"] == "New comment"
+    assert row["section"] is None and row["section_path"] == [] and row["tab_id"] is None
+
+
+def test_create_with_quote_verifies_it_and_tags_the_section(wire):
+    drive = wire([])
+    row = server.drive_comment_create("personal", "doc-1", "Re: this", quoted_text="world")
+    assert [n for n, _ in drive.log] == ["files.get", "comments.create"]
+    _, kw = drive.log[-1]
+    assert kw["body"] == {
+        "content": "Re: this",
+        "quotedFileContent": {"mimeType": "text/html", "value": "world"},
+    }
+    assert row["section"] == "Intro" and row["section_path"] == ["Plan", "Intro"] and row["tab_id"] == "t.0"
+    assert row["quoted_text"] == "world"
+
+
+def test_create_with_a_quote_not_in_the_document_raises_and_creates_nothing(wire):
+    drive = wire([])
+    with pytest.raises(ValueError, match="Quote not found"):
+        server.drive_comment_create("personal", "doc-1", "Re: this", quoted_text="nope, not in there")
+    assert "comments.create" not in [n for n, _ in drive.log]
+
+
+def test_create_on_a_non_doc_skips_verification(wire):
+    drive = wire([], mime="application/pdf")
+    row = server.drive_comment_create("personal", "f-1", "hi", quoted_text="anything at all")
+    assert [n for n, _ in drive.log] == ["files.get", "comments.create"]
+    assert "section" not in row
+    assert row["quoted_text"] == "anything at all"

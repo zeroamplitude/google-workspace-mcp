@@ -16,6 +16,9 @@ class _FakeDriveFiles:
     def create(self, **kw):
         return _Call(self.log, "files.create", resp=self.resp, **kw)
 
+    def copy(self, **kw):
+        return _Call(self.log, "files.copy", resp=self.resp, **kw)
+
 
 class _FakeDrive:
     def __init__(self, log, resp):
@@ -76,3 +79,54 @@ def test_no_markdown_means_no_get_or_batch(fake):
     server.docs_create("personal", "Blank")
     assert "get" not in [n for n, _ in docs.log]
     assert "batchUpdate" not in [n for n, _ in docs.log]
+
+
+def test_template_id_copies_instead_of_creating(fake):
+    docs, _drive = fake
+    out = server.docs_create("personal", "New Doc", template_id="tmpl-1")
+    assert [n for n, _ in docs.log] == ["files.copy"]
+    _, kw = docs.log[0]
+    assert kw["fileId"] == "tmpl-1"
+    assert kw["body"] == {"name": "New Doc"}
+    assert kw["supportsAllDrives"] is True
+    assert out["document_id"] == "doc-1"
+
+
+def test_template_id_with_folder_sets_parents(fake):
+    docs, _drive = fake
+    server.docs_create("personal", "New Doc", template_id="tmpl-1", folder_id="folder-1")
+    _, kw = docs.log[0]
+    assert kw["body"] == {"name": "New Doc", "parents": ["folder-1"]}
+
+
+def test_replacements_run_one_batch_update_and_report_occurrences(fake):
+    docs, _drive = fake
+    docs.batch_reply = {
+        "writeControl": {"requiredRevisionId": "rev-2"},
+        "replies": [{"replaceAllText": {"occurrencesChanged": 2}}, {"replaceAllText": {"occurrencesChanged": 0}}],
+    }
+    out = server.docs_create(
+        "personal", "New Doc", template_id="tmpl-1", replacements={"{{name}}": "Acme", "{{date}}": "2026-09-25"}
+    )
+    assert [n for n, _ in docs.log] == ["files.copy", "batchUpdate"]
+    reqs = docs.sent["requests"]
+    assert reqs == [
+        {"replaceAllText": {"containsText": {"text": "{{name}}", "matchCase": True}, "replaceText": "Acme"}},
+        {"replaceAllText": {"containsText": {"text": "{{date}}", "matchCase": True}, "replaceText": "2026-09-25"}},
+    ]
+    assert "writeControl" not in docs.sent
+    assert out["occurrences_replaced"] == {"{{name}}": 2, "{{date}}": 0}
+
+
+def test_template_id_with_replacements_and_markdown_appends_at_the_end(fake):
+    docs, _drive = fake
+    docs.batch_reply = {
+        "writeControl": {"requiredRevisionId": "rev-2"},
+        "replies": [{"replaceAllText": {"occurrencesChanged": 1}}],
+    }
+    out = server.docs_create(
+        "personal", "New Doc", template_id="tmpl-1", replacements={"{{name}}": "Acme"}, markdown="More text"
+    )
+    assert [n for n, _ in docs.log] == ["files.copy", "batchUpdate", "get", "batchUpdate"]
+    assert out["occurrences_replaced"] == {"{{name}}": 1}
+    assert out["document_id"] == "doc-1"

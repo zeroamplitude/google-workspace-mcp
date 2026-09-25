@@ -1464,6 +1464,55 @@ def drive_comment_list(
 
 
 @mcp.tool()
+def drive_comment_create(
+    account: AccountSlug,
+    file_id: str,
+    content: str,
+    quoted_text: str | None = None,
+) -> dict:
+    """Post a new comment on a file.
+
+    Note the Drive API's own limit here: even with `quoted_text` set, it
+    cannot anchor a new comment to a highlighted range in a Google Doc the
+    way the Docs UI does — the comment will show the quote as context, but
+    nothing in the document body itself gets highlighted. For a Google Doc,
+    when `quoted_text` is given it is first located in the document (as
+    drive_comment_list does) so the comment can carry `section` /
+    `section_path`; if the quote can't be found there, this raises instead
+    of creating a comment with a bogus anchor. Returns the new comment in
+    the same shape as drive_comment_list's rows.
+    """
+    mime = (
+        auth.drive(account).files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
+    ).get("mimeType")
+
+    section = section_path = tab_id = None
+    if mime == _GOOGLE_DOC:
+        section_path = []
+        if quoted_text:
+            doc = auth.docs(account).documents().get(documentId=file_id, includeTabsContent=True).execute()
+            for tab in docs_model.flatten_tabs(doc):
+                at = docs_model.locate_quote(tab["body"], quoted_text)
+                if at is not None:
+                    path = docs_model.section_path(docs_model.outline(tab["body"]), at)
+                    section, section_path, tab_id = (path[-1] if path else None), path, tab["tab_id"]
+                    break
+            else:
+                raise ValueError(f"Quote not found in the document: {quoted_text!r}")
+
+    body: dict[str, Any] = {"content": content}
+    if quoted_text:
+        body["quotedFileContent"] = {"mimeType": "text/html", "value": quoted_text}
+    comment = (
+        auth.drive(account).comments().create(fileId=file_id, body=body, fields=_COMMENT_FIELDS).execute()
+    )
+    row = _comment_row(comment)
+    if mime == _GOOGLE_DOC:
+        row.update(section=section, section_path=section_path, tab_id=tab_id)
+    return row
+
+
+@mcp.tool()
 def drive_comment_reply(account: AccountSlug, file_id: str, comment_id: str, content: str) -> dict:
     """Reply to an existing comment. The reply is posted as this account and
     notifies the thread's participants the way a reply in the Docs UI does."""
@@ -1678,26 +1727,64 @@ def docs_create(
     title: str,
     markdown: str | None = None,
     folder_id: str | None = None,
+    template_id: str | None = None,
+    replacements: dict[str, str] | None = None,
 ) -> dict:
-    """Create a new Google Doc, optionally filled with Markdown.
+    """Create a new Google Doc, optionally filled with Markdown or copied from a template.
 
     Creates an empty doc via Drive (so `folder_id` places it in one call,
     instead of create-then-move) and, if `markdown` is given, inserts it into
     the new doc's empty body. Markdown support is as for docs_insert.
-    Returns `document_id`, `title`, `url`, and — when markdown was inserted —
-    the batchUpdate result (`revision_id`, `requests_applied`, `replies`).
+
+    `template_id` copies that Google Doc instead (via Drive files.copy, so
+    its formatting, headers/footers and existing content carry over) and
+    renames the copy to `title`. `replacements` then runs one
+    documents.batchUpdate of replaceAllText over the copy — pass the
+    template's literal placeholders as found in it, e.g.
+    {"{{name}}": "Acme Corp"}; matching is case-sensitive, and
+    `occurrences_replaced` in the result gives each key's count (0 means it
+    wasn't found). `markdown`, if given together with `template_id`, is
+    appended at the end of the copied doc, same as docs_insert(at="end").
+
+    Returns `document_id`, `title`, `url`, `occurrences_replaced` (when
+    `replacements` was given), and — when markdown was inserted — the
+    batchUpdate result (`revision_id`, `requests_applied`, `replies`).
     """
-    metadata: dict[str, Any] = {"name": title, "mimeType": "application/vnd.google-apps.document"}
+    metadata: dict[str, Any] = {"name": title}
     if folder_id:
         metadata["parents"] = [folder_id]
-    file = (
-        auth.drive(account)
-        .files()
-        .create(body=metadata, fields="id, name, webViewLink", supportsAllDrives=True)
-        .execute()
-    )
+    if template_id:
+        file = (
+            auth.drive(account)
+            .files()
+            .copy(fileId=template_id, body=metadata, fields="id, name, webViewLink", supportsAllDrives=True)
+            .execute()
+        )
+    else:
+        file = (
+            auth.drive(account)
+            .files()
+            .create(
+                body={**metadata, "mimeType": "application/vnd.google-apps.document"},
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
     document_id = file["id"]
     out = {"document_id": document_id, "title": file.get("name"), "url": file.get("webViewLink")}
+
+    if replacements:
+        reqs = [
+            {"replaceAllText": {"containsText": {"text": k, "matchCase": True}, "replaceText": v}}
+            for k, v in replacements.items()
+        ]
+        batch = _docs_batch(account, document_id, reqs, None)
+        out["occurrences_replaced"] = {
+            k: (r.get("replaceAllText") or {}).get("occurrencesChanged", 0)
+            for k, r in zip(replacements, batch["replies"])
+        }
+
     if markdown:
         _, tab, revision = _docs_load(account, document_id, None, None)
         body = tab["body"]
