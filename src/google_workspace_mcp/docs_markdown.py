@@ -17,6 +17,10 @@ is its own API call that has to be re-fetched to find the table it made
 before cells can be filled, so `split_markdown_tables` below pulls table
 blocks out of the Markdown for server.py to insert separately, in sequence
 with the surrounding text.
+
+A standalone `<!-- pagebreak -->` line is a page break: like a table, it
+isn't text `insertText` can carry (it needs its own `insertPageBreak`
+request), so `split_markdown_tables` pulls it out the same way.
 """
 
 from __future__ import annotations
@@ -166,6 +170,7 @@ def parse_blocks(md: str) -> list[Para]:
 
 _ROW = re.compile(r"^[ \t]*\|(.*)\|[ \t]*$")
 _SEP_CELL = re.compile(r"^:?-+:?$")
+_PAGEBREAK = re.compile(r"^[ \t]*<!--\s*pagebreak\s*-->[ \t]*$", re.IGNORECASE)
 
 
 def _split_row(line: str) -> list[str]:
@@ -190,12 +195,16 @@ def _split_row(line: str) -> list[str]:
 
 
 def split_markdown_tables(md: str) -> list[tuple[str, object]]:
-    """Split `md` into ("text", str) and ("table", rows) segments, in order.
+    """Split `md` into ("text", str), ("table", rows) and ("pagebreak", None)
+    segments, in order.
 
     A table is a GitHub-style pipe table: a `| a | b |` header row, a
     `|---|---|` separator row of the same width (each cell just dashes,
     optionally `:`-anchored), then zero or more further rows. `rows[0]` is
     the header; data rows are padded/truncated to the header's width.
+
+    A page break is a standalone `<!-- pagebreak -->` line (its own line,
+    nothing else on it).
     """
     lines = md.replace("\r\n", "\n").split("\n")
     segments: list[tuple[str, object]] = []
@@ -208,6 +217,11 @@ def split_markdown_tables(md: str) -> list[tuple[str, object]]:
 
     i, n = 0, len(lines)
     while i < n:
+        if _PAGEBREAK.match(lines[i]):
+            flush()
+            segments.append(("pagebreak", None))
+            i += 1
+            continue
         header = _ROW.match(lines[i])
         sep = _ROW.match(lines[i + 1]) if i + 1 < n else None
         if header and sep:
@@ -235,8 +249,10 @@ def split_markdown_tables(md: str) -> list[tuple[str, object]]:
 # ─── requests ───────────────────────────────────────────────────────────
 
 
-def _range(start: int, end: int, tab_id: str | None) -> dict:
+def _range(start: int, end: int, tab_id: str | None, segment_id: str | None = None) -> dict:
     r = {"startIndex": start, "endIndex": end}
+    if segment_id:
+        r["segmentId"] = segment_id
     if tab_id:
         r["tabId"] = tab_id
     return r
@@ -246,12 +262,17 @@ def _fields(style: dict) -> str:
     return ",".join(style)
 
 
-def markdown_to_requests(md: str, index: int, mode: str = "paragraph", tab_id: str | None = None) -> list[dict]:
+def markdown_to_requests(
+    md: str, index: int, mode: str = "paragraph", tab_id: str | None = None, segment_id: str | None = None
+) -> list[dict]:
     """Requests that insert `md` at `index`.
 
     `mode` comes from docs_model.insertion_mode: "paragraph" (index starts a
     paragraph), "end" / "end_empty" (the body's final position), or
     "inline" (mid-paragraph: text styles only, no paragraph restyling).
+
+    `segment_id` targets a header/footer/footnote instead of the tab's body
+    (its own indices always start at 0, so `index` is usually 0 there).
     """
     paras = parse_blocks(md)
     if not paras:
@@ -267,6 +288,8 @@ def markdown_to_requests(md: str, index: int, mode: str = "paragraph", tab_id: s
     text = prefix + "\n".join(lines) + ("\n" if mode == "paragraph" else "")
 
     loc = {"index": index}
+    if segment_id:
+        loc["segmentId"] = segment_id
     if tab_id:
         loc["tabId"] = tab_id
     reqs: list[dict] = [{"insertText": {"text": text, "location": loc}}]
@@ -290,7 +313,7 @@ def markdown_to_requests(md: str, index: int, mode: str = "paragraph", tab_id: s
         pos += 1
 
     if not inline:
-        whole = _range(first, para_ranges[-1][1], tab_id)
+        whole = _range(first, para_ranges[-1][1], tab_id, segment_id)
         reqs.append({"deleteParagraphBullets": {"range": whole}})
         reqs.append({
             "updateParagraphStyle": {
@@ -301,7 +324,9 @@ def markdown_to_requests(md: str, index: int, mode: str = "paragraph", tab_id: s
         })
     if last_end > first:
         reqs.append({
-            "updateTextStyle": {"range": _range(first, last_end, tab_id), "textStyle": {}, "fields": _RESET_TEXT_FIELDS}
+            "updateTextStyle": {
+                "range": _range(first, last_end, tab_id, segment_id), "textStyle": {}, "fields": _RESET_TEXT_FIELDS
+            }
         })
 
     if not inline:
@@ -309,7 +334,7 @@ def markdown_to_requests(md: str, index: int, mode: str = "paragraph", tab_id: s
             if p.indent:
                 reqs.append({
                     "updateParagraphStyle": {
-                        "range": _range(s, e, tab_id),
+                        "range": _range(s, e, tab_id, segment_id),
                         "paragraphStyle": {"indentStart": _INDENT, "indentFirstLine": _INDENT},
                         "fields": "indentStart,indentFirstLine",
                     }
@@ -317,13 +342,17 @@ def markdown_to_requests(md: str, index: int, mode: str = "paragraph", tab_id: s
             if p.style != "NORMAL_TEXT":
                 reqs.append({
                     "updateParagraphStyle": {
-                        "range": _range(s, e, tab_id),
+                        "range": _range(s, e, tab_id, segment_id),
                         "paragraphStyle": {"namedStyleType": p.style},
                         "fields": "namedStyleType",
                     }
                 })
     for s, e, style in spans:
-        reqs.append({"updateTextStyle": {"range": _range(s, e, tab_id), "textStyle": style, "fields": _fields(style)}})
+        reqs.append({
+            "updateTextStyle": {
+                "range": _range(s, e, tab_id, segment_id), "textStyle": style, "fields": _fields(style)
+            }
+        })
 
     if not inline:
         # Group consecutive list items; the first item's kind sets the preset.
@@ -339,5 +368,9 @@ def markdown_to_requests(md: str, index: int, mode: str = "paragraph", tab_id: s
             else:
                 groups.append((p.list_kind, s, e))
         for kind, s, e in reversed(groups):
-            reqs.append({"createParagraphBullets": {"range": _range(s, e, tab_id), "bulletPreset": _BULLET_PRESET[kind]}})
+            reqs.append({
+                "createParagraphBullets": {
+                    "range": _range(s, e, tab_id, segment_id), "bulletPreset": _BULLET_PRESET[kind]
+                }
+            })
     return reqs

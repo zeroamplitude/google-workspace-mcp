@@ -1699,17 +1699,27 @@ def _insert_table_segment(
     return table["end_index"], out2.get("revision_id", revision2), out2
 
 
-def _insert_markdown(account: str, document_id: str, markdown: str, idx: int, mode: str, tab: dict, revision: str | None) -> dict:
-    """Insert `markdown` at `idx`, handling any GitHub pipe tables in it.
+def _insert_pagebreak_segment(
+    account: str, document_id: str, idx: int, tab_id: str | None, revision: str | None
+) -> tuple[str | None, dict]:
+    """Insert one page break at `idx`. Returns (new revision, the batch result)."""
+    loc = {"index": idx, **({"tabId": tab_id} if tab_id else {})}
+    out = _docs_batch(account, document_id, [{"insertPageBreak": {"location": loc}}], revision)
+    return out.get("revision_id"), out
 
-    Markdown with no table is a single insert, exactly as before. Markdown
-    with one or more tables is applied segment by segment (text, then each
-    table, then more text, ...), each later segment landing right after the
-    one before it.
+
+def _insert_markdown(account: str, document_id: str, markdown: str, idx: int, mode: str, tab: dict, revision: str | None) -> dict:
+    """Insert `markdown` at `idx`, handling any GitHub pipe tables or page
+    breaks in it.
+
+    Markdown with neither is a single insert, exactly as before. Markdown
+    with one or more tables / page breaks is applied segment by segment
+    (text, then each table or page break, then more text, ...), each later
+    segment landing right after the one before it.
     """
     tab_id = tab["tab_id"]
     segments = docs_markdown.split_markdown_tables(markdown)
-    if not any(kind == "table" for kind, _ in segments):
+    if not any(kind != "text" for kind, _ in segments):
         reqs = docs_markdown.markdown_to_requests(markdown, idx, mode, tab_id)
         return {"inserted_at": idx, **_docs_batch(account, document_id, reqs, revision)}
 
@@ -1725,8 +1735,10 @@ def _insert_markdown(account: str, document_id: str, markdown: str, idx: int, mo
                 continue
             reqs = docs_markdown.markdown_to_requests(payload, idx, mode, tab_id)
             last_out = _docs_batch(account, document_id, reqs, revision)
-        else:
+        elif kind == "table":
             _, _, last_out = _insert_table_segment(account, document_id, payload, idx, mode, tab_id, revision)
+        else:  # "pagebreak"
+            _, last_out = _insert_pagebreak_segment(account, document_id, idx, tab_id, revision)
         _, fresh, revision = _docs_load(account, document_id, tab_id, None)
         idx = docs_model.body_end(fresh["body"]) - tail
         mode = docs_model.insertion_mode(fresh["body"], idx)
@@ -1913,9 +1925,10 @@ def docs_insert(
     Markdown supported: # headings, paragraphs, **bold**, *italic*, `code`,
     [links](url), - bullets, 1. numbered lists (indent 2 spaces to nest),
     - [ ] / - [x] checklists, ``` code blocks, > quotes (an indented
-    paragraph), and GitHub-style pipe tables (a `| a | b |` header, a
-    `|---|---|` separator row, then data rows; the header row is bolded).
-    Anything else is inserted as literal text.
+    paragraph), GitHub-style pipe tables (a `| a | b |` header, a
+    `|---|---|` separator row, then data rows; the header row is bolded),
+    and a standalone `<!-- pagebreak -->` line for a page break. Anything
+    else is inserted as literal text.
     """
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
@@ -1973,7 +1986,7 @@ def docs_replace_section(
         idx, mode = end - 1, "end"
 
     segments = docs_markdown.split_markdown_tables(markdown)
-    if not any(kind == "table" for kind, _ in segments):
+    if not any(kind != "text" for kind, _ in segments):
         reqs += docs_markdown.markdown_to_requests(markdown, idx, mode, loc_tab)
         return {
             "section": section.heading,
@@ -2289,17 +2302,32 @@ def docs_insert_image(
     return {"inserted_at": img_at, "object_id": reply.get("objectId"), **out}
 
 
+_TABLE_ACTIONS = (
+    "insert_row", "insert_column", "delete_row", "delete_column", "set_cell",
+    "merge_cells", "unmerge_cells", "style_cell", "pin_header_rows", "set_column_width",
+)
+_NEEDS_ROW = {"insert_row", "insert_column", "delete_row", "delete_column", "set_cell",
+              "merge_cells", "unmerge_cells", "style_cell"}
+_NEEDS_COLUMN = {"set_cell", "insert_column", "delete_column",
+                  "merge_cells", "unmerge_cells", "style_cell", "set_column_width"}
+
+
 @mcp.tool()
 def docs_table_edit(
     account: AccountSlug,
     document_id: str,
     table_index: int,
-    action: Literal["insert_row", "insert_column", "delete_row", "delete_column", "set_cell"],
-    row: int,
+    action: Literal[_TABLE_ACTIONS],
+    row: int = 0,
     column: int = 0,
     text: str | None = None,
     below: bool = True,
     right: bool = True,
+    row_span: int = 1,
+    column_span: int = 1,
+    background_color: str | None = None,
+    count: int | None = None,
+    width_pt: float | None = None,
     tab_id: str | None = None,
     revision_id: str | None = None,
 ) -> dict:
@@ -2320,6 +2348,16 @@ def docs_table_edit(
     - "set_cell": replaces cell (`row`, `column`)'s text with `text`
       (required for this action; supports the same inline **bold**/*italic*/
       `code`/[link](url) markdown as docs_insert).
+    - "merge_cells" / "unmerge_cells": merges (or unmerges) the block of
+      cells starting at (`row`, `column`) and spanning `row_span` rows by
+      `column_span` columns (both default 1, i.e. just that one cell).
+    - "style_cell": sets `background_color` (required; hex, like '#e33') on
+      the cell at (`row`, `column`), or a block of cells with `row_span` /
+      `column_span`.
+    - "pin_header_rows": pins the table's first `count` rows (required) as
+      repeating header rows; `count=0` unpins.
+    - "set_column_width": sets `column`'s width to `width_pt` points
+      (required), fixed rather than auto-sized.
     """
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
@@ -2328,10 +2366,11 @@ def docs_table_edit(
         raise ValueError(f"No table at table_index {table_index}; this tab has {len(tables)} table(s).")
     table = tables[table_index]
     loc_tab = tab["tab_id"]
+    table_start = {"index": table["start_index"], **({"tabId": loc_tab} if loc_tab else {})}
 
-    if not 0 <= row < table["rows"]:
+    if action in _NEEDS_ROW and not 0 <= row < table["rows"]:
         raise ValueError(f"row must be between 0 and {table['rows'] - 1} for this table, got {row}.")
-    if action in ("set_cell", "insert_column", "delete_column") and not 0 <= column < table["columns"]:
+    if action in _NEEDS_COLUMN and not 0 <= column < table["columns"]:
         raise ValueError(f"column must be between 0 and {table['columns'] - 1} for this table, got {column}.")
 
     if action == "set_cell":
@@ -2357,11 +2396,48 @@ def docs_table_edit(
             pos += n
         return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, reqs, revision)}
 
-    cell_loc = {
-        "tableStartLocation": {"index": table["start_index"], **({"tabId": loc_tab} if loc_tab else {})},
-        "rowIndex": row,
-        "columnIndex": column,
-    }
+    if action in ("merge_cells", "unmerge_cells", "style_cell"):
+        if row_span < 1 or row + row_span > table["rows"]:
+            raise ValueError(f"row_span must keep row+row_span within 1..{table['rows']}, got {row_span}.")
+        if column_span < 1 or column + column_span > table["columns"]:
+            raise ValueError(f"column_span must keep column+column_span within 1..{table['columns']}, got {column_span}.")
+        table_range = {
+            "tableCellLocation": {"tableStartLocation": table_start, "rowIndex": row, "columnIndex": column},
+            "rowSpan": row_span,
+            "columnSpan": column_span,
+        }
+        if action == "merge_cells":
+            req = {"mergeTableCells": {"tableRange": table_range}}
+        elif action == "unmerge_cells":
+            req = {"unmergeTableCells": {"tableRange": table_range}}
+        else:
+            if not background_color:
+                raise ValueError('action="style_cell" needs `background_color`.')
+            req = {"updateTableCellStyle": {
+                "tableRange": table_range,
+                "tableCellStyle": {"backgroundColor": _rgb(background_color)},
+                "fields": "backgroundColor",
+            }}
+        return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, [req], revision)}
+
+    if action == "pin_header_rows":
+        if count is None or count < 0:
+            raise ValueError('action="pin_header_rows" needs a non-negative `count`.')
+        req = {"pinTableHeaderRows": {"tableStartLocation": table_start, "pinnedHeaderRowsCount": count}}
+        return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, [req], revision)}
+
+    if action == "set_column_width":
+        if width_pt is None or width_pt <= 0:
+            raise ValueError('action="set_column_width" needs a positive `width_pt`.')
+        req = {"updateTableColumnProperties": {
+            "tableStartLocation": table_start,
+            "columnIndices": [column],
+            "tableColumnProperties": {"width": {"magnitude": width_pt, "unit": "PT"}, "widthType": "FIXED_WIDTH"},
+            "fields": "width,widthType",
+        }}
+        return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, [req], revision)}
+
+    cell_loc = {"tableStartLocation": table_start, "rowIndex": row, "columnIndex": column}
     if action == "insert_row":
         req = {"insertTableRow": {"tableCellLocation": cell_loc, "insertBelow": below}}
     elif action == "insert_column":
@@ -2371,6 +2447,111 @@ def docs_table_edit(
     else:
         req = {"deleteTableColumn": {"tableCellLocation": cell_loc}}
     return {"table_index": table_index, "action": action, **_docs_batch(account, document_id, [req], revision)}
+
+
+# name -> (Request/Response name fragment, the id field, the DocumentStyle field, the doc's map of them)
+_HF = {
+    "header": ("Header", "headerId", "defaultHeaderId", "headers"),
+    "footer": ("Footer", "footerId", "defaultFooterId", "footers"),
+}
+
+
+@mcp.tool()
+def docs_header_footer(
+    account: AccountSlug,
+    document_id: str,
+    kind: Literal["header", "footer"],
+    action: Literal["set", "delete"],
+    text: str | None = None,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Set or delete a Google Doc's default header or footer, in place.
+
+    `action="set"` needs `text` (Markdown, as for docs_insert, or plain
+    text) — it creates the header/footer if the tab doesn't have one yet, or
+    replaces its whole existing content otherwise. `action="delete"` removes
+    it. Only the tab's default header/footer is addressed here, not the
+    first-page or even-page variants.
+    """
+    cap, id_field, style_field, map_field = _HF[kind]
+    if action == "set" and not text:
+        raise ValueError('action="set" needs `text`.')
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    loc_tab = tab["tab_id"]
+    hf_id = tab["style"].get(style_field)
+
+    if action == "delete":
+        if not hf_id:
+            raise ValueError(f"This tab has no {kind} to delete.")
+        req = {f"delete{cap}": {id_field: hf_id, **({"tabId": loc_tab} if loc_tab else {})}}
+        return {"kind": kind, "action": action, **_docs_batch(account, document_id, [req], revision)}
+
+    if hf_id:  # replace its content: clear down to its own final newline, then fill
+        seg = tab[map_field].get(hf_id, {})
+        end = docs_model.body_end(seg)
+        reqs: list[dict] = []
+        if end > 1:
+            rng = {"startIndex": 0, "endIndex": end - 1, "segmentId": hf_id, **({"tabId": loc_tab} if loc_tab else {})}
+            reqs.append({"deleteContentRange": {"range": rng}})
+        reqs += docs_markdown.markdown_to_requests(text, 0, "end_empty", loc_tab, hf_id)
+        out = _docs_batch(account, document_id, reqs, revision)
+        return {"kind": kind, "action": action, f"{kind}_id": hf_id, **out}
+
+    create_body: dict[str, Any] = {"type": "DEFAULT"}
+    if loc_tab:
+        create_body["sectionBreakLocation"] = {"tabId": loc_tab}
+    out1 = _docs_batch(account, document_id, [{f"create{cap}": create_body}], revision)
+    hf_id = next(r[f"create{cap}"][id_field] for r in out1["replies"] if r.get(f"create{cap}"))
+    reqs = docs_markdown.markdown_to_requests(text, 0, "end_empty", loc_tab, hf_id)
+    out2 = _docs_batch(account, document_id, reqs, out1.get("revision_id"))
+    return {"kind": kind, "action": action, f"{kind}_id": hf_id, **out2}
+
+
+@mcp.tool()
+def docs_footnote(
+    account: AccountSlug,
+    document_id: str,
+    text: str,
+    at: Literal["end", "start", "after_heading", "index"] = "end",
+    heading: str | None = None,
+    index: int | None = None,
+    after_text: str | None = None,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Add a footnote to a Google Doc, in place.
+
+    Where the footnote reference (the small superscript marker in the body
+    text) is inserted: `after_text` places it right after the first
+    occurrence of that quoted text (whitespace-tolerant, like a comment's
+    anchor — see drive_comment_list's `quoted_text`); otherwise placement is
+    as for docs_insert (`at="end"` / `"start"` / `"after_heading"` +
+    `heading` / `"index"` + `index`).
+
+    `text` is the footnote's own content, at the bottom of the page —
+    Markdown, as for docs_insert, or plain text.
+    """
+    if not text:
+        raise ValueError("`text` is required.")
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    loc_tab = tab["tab_id"]
+
+    if after_text:
+        at_idx = docs_model.locate_quote(body, after_text)
+        if at_idx is None:
+            raise ValueError(f"{after_text!r} does not appear in this tab.")
+        idx = at_idx + docs_model.utf16_len(after_text)
+    else:
+        idx = _insert_index(body, at, heading, index)
+
+    loc = {"index": idx, **({"tabId": loc_tab} if loc_tab else {})}
+    out1 = _docs_batch(account, document_id, [{"createFootnote": {"location": loc}}], revision)
+    footnote_id = next(r["createFootnote"]["footnoteId"] for r in out1["replies"] if r.get("createFootnote"))
+    reqs = docs_markdown.markdown_to_requests(text, 0, "end_empty", loc_tab, footnote_id)
+    out2 = _docs_batch(account, document_id, reqs, out1.get("revision_id"))
+    return {"footnote_id": footnote_id, "inserted_at": idx, **out2}
 
 
 # ─── Tasks (Google Tasks) ────────────────────────────────────────────────
