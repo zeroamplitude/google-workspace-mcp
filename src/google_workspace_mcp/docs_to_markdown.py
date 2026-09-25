@@ -114,7 +114,11 @@ def _para_inline_md(elements: list[dict]) -> str:
 
 
 def _list_kind(lists: dict, list_id: str | None, level: int) -> str:
-    """"bullet" or "number", from lists[list_id].listProperties.nestingLevels[level]."""
+    """"bullet", "number" or "check", from lists[list_id].listProperties.nestingLevels[level].
+
+    A checkbox list (preset BULLET_CHECKBOX) is the one with neither a
+    numbering glyphType nor a glyphSymbol.
+    """
     levels = ((lists or {}).get(list_id or "") or {}).get("listProperties", {}).get("nestingLevels", [])
     if not levels:
         return "bullet"
@@ -122,6 +126,8 @@ def _list_kind(lists: dict, list_id: str | None, level: int) -> str:
     glyph_type = props.get("glyphType")
     if glyph_type and glyph_type not in ("GLYPH_TYPE_UNSPECIFIED", "NONE"):
         return "number"
+    if not props.get("glyphSymbol"):
+        return "check"
     return "bullet"
 
 
@@ -134,7 +140,14 @@ def _paragraph_block(p: dict, lists: dict) -> tuple[str | None, bool]:
     bullet = p.get("bullet")
     if bullet:
         level = bullet.get("nestingLevel", 0)
-        marker = "1. " if _list_kind(lists, bullet.get("listId"), level) == "number" else "- "
+        kind = _list_kind(lists, bullet.get("listId"), level)
+        if kind == "check":
+            # docs_markdown marks a done item with strikethrough (the API can't
+            # tick a box), so all-struck text reads back as [x], unstruck.
+            if text.startswith("~~") and text.endswith("~~") and len(text) > 4:
+                return "  " * level + "- [x] " + text[2:-2], True
+            return "  " * level + "- [ ] " + text, True
+        marker = "1. " if kind == "number" else "- "
         return "  " * level + marker + text, True
     if not text:
         return None, False

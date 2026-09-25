@@ -22,7 +22,7 @@ A **multi-account** Google Workspace MCP server for [Claude Code](https://code.c
 - **Per-project access control.** Accounts are configured at *runtime*, never baked into code. Each project's `.mcp.json` scopes it to a subset, so a personal project never even sees your work account.
 - **Your own OAuth client.** You bring a (free) Google Cloud OAuth client, so you own the access and get the full tool surface — including things the default `claude.ai` connector can't do, like deleting a draft. Nothing is routed through anyone else's infrastructure.
 - **Secrets stay out of the tree.** The OAuth client and per-account refresh tokens live under `~/.config/google-workspace-mcp/` (written `0600`), never next to code.
-- **58 tools across six services** — see the [catalog](#tools) below.
+- **60 tools across six services** — see the [catalog](#tools) below.
 
 ## Table of contents
 
@@ -235,13 +235,15 @@ Edits change the live Google Doc through the Docs API — the rest of the docume
 
 | Tool | What it does |
 |---|---|
-| `docs_get` | Text, tabs, `revision_id` and a heading **outline** with each section's index range — how Claude finds where to edit. |
-| `docs_insert` | Insert **Markdown** (headings, bold/italic, code, links, bullets, numbered lists, code blocks, `>` indented paragraphs) as native Docs formatting — at the start or end, after a heading's section, or at an index. |
-| `docs_replace_section` | Rewrite everything under a heading with Markdown. Refuses a section holding a table, image, TOC or section break rather than deleting it. |
+| `docs_create` | Create a Google Doc, optionally in a folder and already filled from Markdown. |
+| `docs_get` | Text — or **Markdown** with its formatting, for rewrites that keep it — plus tabs, tables, `revision_id` and a heading **outline** with each section's index range: how Claude finds where to edit. |
+| `docs_insert` | Insert **Markdown** (headings, bold/italic, code, links, bullets, numbered lists, checklists, **tables**, code blocks, `>` indented paragraphs) as native Docs formatting — at the start or end, after a heading's section, or at an index. |
+| `docs_replace_section` | Rewrite everything under a heading with Markdown, tables included. Refuses a section holding an image, TOC or section break rather than deleting it. |
 | `docs_replace_text` | Find and replace across the document or one tab; keeps the replaced text's formatting. |
 | `docs_delete_range` | Delete an exact index range from `docs_get`. |
-| `docs_format` | Restyle existing text — **colour**, highlight, **font**, size, bold/italic/underline — for a heading line, a whole section, every occurrence of some text, or an index range. `background_color` is the highlight. |
+| `docs_format` | Restyle existing text — **colour**, highlight, **font**, size, bold/italic/underline — plus paragraph **alignment**, line spacing, space above/below and indent — for a heading line, a whole section, every occurrence of some text, or an index range. `background_color` is the highlight. |
 | `docs_insert_image` | Insert a PNG/JPEG/GIF from a URL or a local file, placed like `docs_insert`, optionally sized. A local file is shared on Drive only while Google copies it into the Doc, then unshared and trashed. |
+| `docs_table_edit` | Add or delete a table's rows and columns, or set a cell's text. |
 
 Every write is pinned to the revision it was computed from, so an edit a person made in the meantime makes the call fail instead of landing at the wrong place. Pass `revision_id` from `docs_get` to extend that guarantee back to when Claude read the text.
 
@@ -344,9 +346,10 @@ google-workspace-mcp/
 ├── commands/
 │   └── google-workspace-setup.md    # /google-workspace-setup — guided setup
 ├── src/google_workspace_mcp/
-│   ├── server.py                    # the MCP server — all 58 tools
+│   ├── server.py                    # the MCP server — all 60 tools
 │   ├── docs_model.py                # Docs JSON → outline, sections, UTF-16 indices
 │   ├── docs_markdown.py             # Markdown → Docs batchUpdate requests
+│   ├── docs_to_markdown.py          # Docs JSON → Markdown, for docs_get(format="markdown")
 │   ├── auth.py                      # token load/refresh + Google service builders
 │   ├── accounts.py                  # runtime account registry + GWM_ACCOUNTS scoping
 │   └── authorize.py                 # standalone OAuth consent flow (CLI)

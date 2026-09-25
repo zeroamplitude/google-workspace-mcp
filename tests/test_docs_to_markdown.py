@@ -104,10 +104,22 @@ def test_numbered_list_glyph_type():
     assert [(p.list_kind, p.text) for p in paras] == [("number", "first"), ("number", "second")]
 
 
-def test_glyph_type_unspecified_or_none_is_still_a_bullet():
-    lists = {"l": {"listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED"}]}}}
+def test_glyph_type_unspecified_with_a_symbol_is_a_bullet():
+    lists = {"l": {"listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED", "glyphSymbol": "●"}]}}}
     body = make_body(("NORMAL_TEXT", "a", {"bullet": _bullet("l", 0)}))
     assert parse_blocks(body_to_markdown(body, lists))[0].list_kind == "bullet"
+
+
+def test_checkbox_list_reads_back_as_a_checklist():
+    # The shape the live API returns for a BULLET_CHECKBOX list: no glyphType, no glyphSymbol.
+    lists = {"c": {"listProperties": {"nestingLevels": [{"glyphType": "GLYPH_TYPE_UNSPECIFIED", "glyphFormat": "%0"}]}}}
+    body = make_body(
+        ("NORMAL_TEXT", "todo", {"bullet": _bullet("c", 0)}),
+        ("NORMAL_TEXT", [("done", {"strikethrough": True})], {"bullet": _bullet("c", 0)}),
+    )
+    md = body_to_markdown(body, lists)
+    assert md == "- [ ] todo\n- [x] done"
+    assert [p.list_kind for p in parse_blocks(md)] == ["check", "check"]
 
 
 def test_list_with_no_matching_entry_defaults_to_bullet():

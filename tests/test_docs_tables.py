@@ -12,17 +12,17 @@ from google_workspace_mcp import docs_markdown, docs_model, server
 
 
 class _SeqFakeDocs(_FakeDocs):
-    """Like _FakeDocs, but `get` returns `doc2` from its second call on —
-    the document state a re-fetch would see right after insertTable."""
+    """Like _FakeDocs, but successive `get`s return successive docs (the last
+    one repeating) — the states re-fetches see after a delete or insertTable."""
 
-    def __init__(self, doc1, doc2):
-        super().__init__(doc1)
-        self.doc2 = doc2
+    def __init__(self, *docs):
+        super().__init__(docs[0])
+        self.docs = docs
         self.get_calls = 0
 
     def get(self, **kw):
+        resp = self.docs[min(self.get_calls, len(self.docs) - 1)]
         self.get_calls += 1
-        resp = self.doc if self.get_calls == 1 else self.doc2
         return _Call(self.log, "get", resp=resp, **kw)
 
     def batches(self):
@@ -99,7 +99,7 @@ def test_insert_table_at_end_inserts_a_newline_then_fills_cells_in_reverse(monke
     md = "| H1 | H2 |\n|---|---|\n| a | b |"
     out = server.docs_insert("personal", "doc-1", md)
 
-    assert [n for n, _ in svc.log] == ["get", "batchUpdate", "get", "batchUpdate"]
+    assert [n for n, _ in svc.log] == ["get", "batchUpdate", "get", "batchUpdate", "get"]  # final get: where the next segment would go
     batches = svc.batches()
     assert batches[0] == {
         "requests": [
@@ -169,13 +169,16 @@ def test_insert_table_supports_inline_markdown_in_cells(monkeypatch):
 
 def test_replace_section_inserts_a_table_in_two_batches_after_the_delete(monkeypatch):
     doc1 = make_doc(("HEADING_1", "Sec"), ("NORMAL_TEXT", "old"), ("HEADING_1", "Next"))
+    deleted = make_doc(("HEADING_1", "Sec"), ("HEADING_1", "Next"), revision="rev-1b")
     doc2 = make_doc(("HEADING_1", "Sec"), ("table", [[""]]), ("HEADING_1", "Next"), revision="rev-2")
-    svc = _SeqFakeDocs(doc1, doc2)
+    svc = _SeqFakeDocs(doc1, deleted, doc2)
     monkeypatch.setattr(server.auth, "docs", lambda account: svc)
 
     out = server.docs_replace_section("personal", "doc-1", "Sec", "| x |\n|---|")
 
-    assert [n for n, _ in svc.log] == ["get", "batchUpdate", "batchUpdate", "get", "batchUpdate"]
+    # The re-read after the delete is what the insert measures from (a stale,
+    # pre-delete read put the table inside earlier text, found live).
+    assert [n for n, _ in svc.log] == ["get", "batchUpdate", "get", "batchUpdate", "get", "batchUpdate", "get"]
     batches = svc.batches()
     assert batches[0] == {
         "requests": [{"deleteContentRange": {"range": {"startIndex": 5, "endIndex": 9, "tabId": "t.0"}}}],
@@ -264,3 +267,27 @@ def test_table_edit_validates_table_row_and_column(table_fake):
     with pytest.raises(ValueError, match="column must be between 0 and 1"):
         server.docs_table_edit("personal", "doc-1", 0, "set_cell", row=0, column=9, text="x")
     assert [n for n, _ in table_fake.log] == ["get", "get", "get"]  # never reached batchUpdate
+
+
+def test_the_empty_paragraph_insert_table_leaves_above_is_folded_away(monkeypatch):
+    before = make_doc(("HEADING_1", "Sec"), ("NORMAL_TEXT", "next"))  # Sec 1..5, next 5..10
+    # What a re-fetch sees after insertTable at 5: an empty paragraph, then the table.
+    after = make_doc(("HEADING_1", "Sec"), ("NORMAL_TEXT", ""), ("table", [[""]]), ("NORMAL_TEXT", "next"))
+    svc = _SeqFakeDocs(before, after)
+    monkeypatch.setattr(server.auth, "docs", lambda account: svc)
+    server.docs_insert("personal", "doc-1", "| x |\n|---|", at="index", index=5)
+    # Deletes the heading's newline (4..5), not the one right before the table (5..6).
+    assert svc.batches()[-1]["requests"] == [
+        {"deleteContentRange": {"range": {"startIndex": 4, "endIndex": 5, "tabId": "t.0"}}}
+    ]
+
+
+def test_no_fold_when_the_gap_follows_another_table(monkeypatch):
+    before = make_doc(("table", [["a"]]), ("NORMAL_TEXT", "next"))
+    after = make_doc(("table", [["a"]]), ("NORMAL_TEXT", ""), ("table", [[""]]), ("NORMAL_TEXT", "next"))
+    svc = _SeqFakeDocs(before, after)
+    monkeypatch.setattr(server.auth, "docs", lambda account: svc)
+    t0_end = server.docs_get("personal", "doc-1")["tables"][0]["end_index"]
+    svc.get_calls = 0
+    server.docs_insert("personal", "doc-1", "| x |\n|---|", at="index", index=t0_end)
+    assert not any("deleteContentRange" in r for b in svc.batches() for r in b["requests"])

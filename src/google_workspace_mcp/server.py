@@ -1621,6 +1621,20 @@ def _insert_table_segment(
     if table is None:
         raise ValueError("Inserted a table but could not find it again after re-fetching the document.")
     out2 = _fill_table(account, document_id, table, rows, tab_id, revision2)
+
+    # insertTable always adds a newline before the table, leaving an empty
+    # paragraph above it; that newline itself can't be deleted (Docs refuses
+    # to delete the newline before a table), but the previous paragraph's can,
+    # which folds the empty one away and keeps the previous paragraph's style
+    # (verified live, a heading included). Cell fills sit after the table, so
+    # the indices here are unchanged by them.
+    t = table["start_index"]
+    paras = {p["start_index"]: p for p in docs_model.paragraphs(tab2["body"])}
+    gap = paras.get(t - 1)
+    before = next((p for p in paras.values() if p["end_index"] == t - 1), None)
+    if gap and not gap["text"] and before is not None:
+        rng = {"startIndex": t - 2, "endIndex": t - 1, **({"tabId": tab_id} if tab_id else {})}
+        out2 = _docs_batch(account, document_id, [{"deleteContentRange": {"range": rng}}], out2.get("revision_id"))
     return table["end_index"], out2.get("revision_id", revision2), out2
 
 
@@ -1638,7 +1652,11 @@ def _insert_markdown(account: str, document_id: str, markdown: str, idx: int, mo
         reqs = docs_markdown.markdown_to_requests(markdown, idx, mode, tab_id)
         return {"inserted_at": idx, **_docs_batch(account, document_id, reqs, revision)}
 
+    # Each segment changes the document's length, so rather than predicting
+    # where the next one goes, re-read after each: whatever followed the
+    # insertion point is untouched, so it stays `tail` units from the end.
     first_idx = idx
+    tail = docs_model.body_end(tab["body"]) - idx
     last_out: dict = {}
     for kind, payload in segments:
         if kind == "text":
@@ -1646,11 +1664,11 @@ def _insert_markdown(account: str, document_id: str, markdown: str, idx: int, mo
                 continue
             reqs = docs_markdown.markdown_to_requests(payload, idx, mode, tab_id)
             last_out = _docs_batch(account, document_id, reqs, revision)
-            revision = last_out["revision_id"]
-            idx += docs_model.utf16_len(reqs[0]["insertText"]["text"])
         else:
-            idx, revision, last_out = _insert_table_segment(account, document_id, payload, idx, mode, tab_id, revision)
-        mode = "paragraph"
+            _, _, last_out = _insert_table_segment(account, document_id, payload, idx, mode, tab_id, revision)
+        _, fresh, revision = _docs_load(account, document_id, tab_id, None)
+        idx = docs_model.body_end(fresh["body"]) - tail
+        mode = docs_model.insertion_mode(fresh["body"], idx)
     return {"inserted_at": first_idx, **last_out}
 
 
@@ -1831,7 +1849,9 @@ def docs_replace_section(
         }
 
     if reqs:  # the delete goes first, on its own, then the segments follow it
-        revision = _docs_batch(account, document_id, reqs, revision)["revision_id"]
+        _docs_batch(account, document_id, reqs, revision)
+        # _insert_markdown measures from the end of the tab: give it the post-delete one.
+        _, tab, revision = _docs_load(account, document_id, tab_id, None)
     result = _insert_markdown(account, document_id, markdown, idx, mode, tab, revision)
     return {"section": section.heading, "replaced_range": [start, stop], **result}
 

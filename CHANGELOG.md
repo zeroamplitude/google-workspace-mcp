@@ -10,6 +10,36 @@ only when it is bumped.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-25
+
+### Added
+
+- `docs_create`: a new Google Doc, optionally in a folder and filled from
+  Markdown in the same call.
+- Tables: GitHub pipe tables in Markdown become real Docs tables (header row
+  bold) in `docs_insert`, `docs_replace_section` and `docs_create`;
+  `docs_table_edit` adds or deletes rows and columns and sets a cell's text;
+  `docs_get` lists each table's rows, columns and cells.
+- `docs_get(format="markdown")` returns the tab as Markdown with its
+  formatting — headings, bold/italic/code/links, lists, checklists, quotes,
+  tables — so a rewrite can keep it instead of flattening it.
+- Checklists: `- [ ]` / `- [x]` become Docs checkboxes. The API can't tick a
+  box, so a done item is struck through, and reads back as `[x]`.
+- `docs_format` paragraph options: alignment, line spacing, space above and
+  below, and indent.
+
+### Changed
+
+- `docs_replace_section` now replaces a section holding a table instead of
+  refusing; an image, table of contents or section break still refuses.
+
+### Fixed (found testing live, before release)
+
+- Markdown with a table in it placed later segments at stale indices — after
+  an end-of-document insert, and after a section rewrite's delete. Each
+  segment is now placed by re-reading the document.
+- `insertTable` left an empty paragraph above every table; it is folded away.
+
 ## [0.13.0] - 2026-09-25
 
 ### Added
