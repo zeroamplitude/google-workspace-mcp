@@ -1558,10 +1558,22 @@ def drive_comment_resolve(
 # indices that no longer point where they did.
 
 
-def _docs_load(account: str, document_id: str, tab_id: str | None, revision_id: str | None):
+def _docs_load(
+    account: str,
+    document_id: str,
+    tab_id: str | None,
+    revision_id: str | None,
+    suggestions_view_mode: str | None = None,
+):
     """Fetch the document; refuse if it moved on from `revision_id`."""
+    kw = {"suggestionsViewMode": suggestions_view_mode} if suggestions_view_mode else {}
     try:
-        doc = auth.docs(account).documents().get(documentId=document_id, includeTabsContent=True).execute()
+        doc = (
+            auth.docs(account)
+            .documents()
+            .get(documentId=document_id, includeTabsContent=True, **kw)
+            .execute()
+        )
     except HttpError as e:
         if e.resp.status == 400:
             raise ValueError(
@@ -1794,6 +1806,13 @@ def docs_create(
     return out
 
 
+_SUGGESTIONS_VIEW_MODE = {
+    "inline": "SUGGESTIONS_INLINE",
+    "accepted": "PREVIEW_SUGGESTIONS_ACCEPTED",
+    "original": "PREVIEW_WITHOUT_SUGGESTIONS",
+}
+
+
 @mcp.tool()
 def docs_get(
     account: AccountSlug,
@@ -1801,6 +1820,7 @@ def docs_get(
     tab_id: str | None = None,
     include_paragraphs: bool = False,
     format: Literal["text", "markdown"] = "text",
+    suggestions_view_mode: Literal["inline", "accepted", "original"] | None = None,
 ) -> dict:
     """Read a Google Doc for editing: its text, tabs, and heading outline.
 
@@ -1814,15 +1834,28 @@ def docs_get(
     index range, for exact edits with docs_delete_range / docs_insert(index=).
     Indices are per tab; without `tab_id` the first tab is used.
 
+    Also returns `headers` and `footers` (each `{headerId/footerId: text}`,
+    every one the tab defines, not just the one active on a given page) and
+    `has_pending_suggestions` (true if any text in the tab is a suggested
+    insertion or deletion awaiting review).
+
     `format="markdown"` returns the tab's content as `markdown` instead of
     `text`, in the same Markdown subset docs_insert / docs_replace_section
     write (headings, bold/italic/code/links, lists, quotes, tables; images
     and strikethrough render too, though they won't round-trip through a
     write). Prefer it when about to rewrite a section with docs_replace_section
     or docs_insert — plain `text` flattens formatting, so a rewrite built from
-    it would silently lose bold/links/lists.
+    it would silently lose bold/links/lists. A footnote reference renders as
+    `[^N]` (`[N]` in `text`), with its definition appended at the end.
+
+    `suggestions_view_mode` reads the document as Google Docs' "Suggesting
+    view" options do: "inline" keeps suggested edits marked up in place
+    (SUGGESTIONS_INLINE), "accepted" reads it as if every suggestion were
+    applied (PREVIEW_SUGGESTIONS_ACCEPTED), "original" as if none were
+    (PREVIEW_WITHOUT_SUGGESTIONS). Left unset, the API's own default applies.
     """
-    doc, tab, revision = _docs_load(account, document_id, tab_id, None)
+    view_mode = _SUGGESTIONS_VIEW_MODE.get(suggestions_view_mode) if suggestions_view_mode else None
+    doc, tab, revision = _docs_load(account, document_id, tab_id, None, view_mode)
     body = tab["body"]
     out = {
         "document_id": document_id,
@@ -1836,11 +1869,24 @@ def docs_get(
         "body_end_index": docs_model.body_end(body),
         "outline": [s.as_dict() for s in docs_model.outline(body)],
         "tables": docs_model.tables(body),
+        "has_pending_suggestions": docs_model.has_pending_suggestions(tab),
     }
+    lists = tab.get("lists", {})
     if format == "markdown":
-        out["markdown"] = docs_to_markdown.body_to_markdown(body, tab.get("lists", {}))
+        md = docs_to_markdown.body_to_markdown(body, lists)
+        out["markdown"] = md + docs_to_markdown.footnotes_markdown(body, tab.get("footnotes", {}), lists)
+        out["headers"] = {hid: docs_to_markdown.body_to_markdown(h, lists) for hid, h in tab.get("headers", {}).items()}
+        out["footers"] = {fid: docs_to_markdown.body_to_markdown(f, lists) for fid, f in tab.get("footers", {}).items()}
     else:
-        out["text"] = docs_model.plain_text(body)
+        text = docs_model.plain_text_with_footnotes(body.get("content", []))
+        footnotes = tab.get("footnotes", {})
+        refs = list(dict.fromkeys(docs_model.footnote_references(body.get("content", []))))
+        if refs:
+            defs = "\n".join(f"[{number}] {docs_model.plain_text(footnotes.get(fid, {})).strip()}" for fid, number in refs)
+            text += "\n\n" + defs
+        out["text"] = text
+        out["headers"] = {hid: docs_model.plain_text(h).rstrip("\n") for hid, h in tab.get("headers", {}).items()}
+        out["footers"] = {fid: docs_model.plain_text(f).rstrip("\n") for fid, f in tab.get("footers", {}).items()}
     if include_paragraphs:
         out["paragraphs"] = docs_model.paragraphs(body)
     return out

@@ -46,6 +46,9 @@ def flatten_tabs(doc: dict) -> list[dict]:
                 "depth": depth,
                 "body": doc_tab.get("body", {}),
                 "lists": doc_tab.get("lists", {}),
+                "headers": doc_tab.get("headers", {}),
+                "footers": doc_tab.get("footers", {}),
+                "footnotes": doc_tab.get("footnotes", {}),
             })
             walk(t.get("childTabs", []), depth + 1)
 
@@ -54,6 +57,9 @@ def flatten_tabs(doc: dict) -> list[dict]:
         out.append({
             "tab_id": None, "title": None, "depth": 0,
             "body": doc.get("body", {}), "lists": doc.get("lists", {}),
+            "headers": doc.get("headers", {}),
+            "footers": doc.get("footers", {}),
+            "footnotes": doc.get("footnotes", {}),
         })
     return out
 
@@ -148,6 +154,57 @@ def text_runs(content: list[dict]) -> list[tuple[int, str]]:
 
 def plain_text(body: dict) -> str:
     return "".join(t for _, t in text_runs(body.get("content", [])))
+
+
+def plain_text_with_footnotes(content: list[dict]) -> str:
+    """`plain_text`, but with each footnote reference shown inline as `[N]`.
+
+    Display only — unlike `text_runs`, it doesn't keep character positions
+    aligned with document indices, so it's for docs_get's `text` output, not
+    for locate_quote / find_all."""
+    out: list[str] = []
+    for el in content:
+        if "paragraph" in el:
+            for e in el["paragraph"].get("elements", []):
+                if "textRun" in e:
+                    out.append(e["textRun"].get("content", ""))
+                elif "footnoteReference" in e:
+                    out.append(f"[{e['footnoteReference'].get('footnoteNumber', '')}]")
+        elif "table" in el:
+            for row in el["table"].get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    out.append(plain_text_with_footnotes(cell.get("content", [])))
+    return "".join(out)
+
+
+def footnote_references(content: list[dict]) -> list[tuple[str, str]]:
+    """(footnoteId, footnoteNumber) for every footnote reference in `content`
+    (a body's or a table cell's `content` list), in reading order."""
+    out: list[tuple[str, str]] = []
+    for el in content:
+        if "paragraph" in el:
+            for e in el["paragraph"].get("elements", []):
+                if "footnoteReference" in e:
+                    ref = e["footnoteReference"]
+                    out.append((ref.get("footnoteId"), ref.get("footnoteNumber", "")))
+        elif "table" in el:
+            for row in el["table"].get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    out.extend(footnote_references(cell.get("content", [])))
+    return out
+
+
+def has_pending_suggestions(node: object) -> bool:
+    """True if `node` (a tab dict, or any piece of Docs API JSON) contains a
+    suggested insertion or deletion anywhere — i.e. the document has edits
+    pending review. Works regardless of `suggestionsViewMode`."""
+    if isinstance(node, dict):
+        if "suggestedInsertionIds" in node or "suggestedDeletionIds" in node:
+            return True
+        return any(has_pending_suggestions(v) for v in node.values())
+    if isinstance(node, list):
+        return any(has_pending_suggestions(v) for v in node)
+    return False
 
 
 def _char_map(body: dict) -> tuple[list[str], list[int]]:

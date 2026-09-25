@@ -56,6 +56,74 @@ def test_get_returns_outline_tabs_and_revision(fake):
     }
     assert out["text"].startswith("Plan\nIntro\nHello 👋 world\n")
     assert out["paragraphs"][1]["style"] == "HEADING_1"
+    assert out["headers"] == {}
+    assert out["footers"] == {}
+    assert out["has_pending_suggestions"] is False
+
+
+def test_get_suggestions_view_mode_is_passed_through(fake):
+    server.docs_get("personal", "doc-1", suggestions_view_mode="accepted")
+    assert fake.log[0] == (
+        "get",
+        {"documentId": "doc-1", "includeTabsContent": True, "suggestionsViewMode": "PREVIEW_SUGGESTIONS_ACCEPTED"},
+    )
+
+
+def _para(text):
+    return {"paragraph": {
+        "elements": [{"textRun": {"content": text}}], "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+    }}
+
+
+def _doc_with_headers_footers_footnotes():
+    body = {"content": [{"startIndex": 1, "endIndex": 13, "paragraph": {
+        "elements": [
+            {"startIndex": 1, "textRun": {"content": "See "}},
+            {"startIndex": 5, "footnoteReference": {"footnoteId": "fn1", "footnoteNumber": "1"}},
+            {"startIndex": 6, "textRun": {"content": " note.\n"}},
+        ],
+        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+    }}]}
+    return {
+        "documentId": "doc-1", "title": "Doc", "revisionId": "rev-1",
+        "tabs": [{
+            "tabProperties": {"tabId": "t.0", "title": "T.0"},
+            "documentTab": {
+                "body": body,
+                "headers": {"h1": {"content": [_para("Header text\n")]}},
+                "footers": {"f1": {"content": [_para("Footer text\n")]}},
+                "footnotes": {"fn1": {"content": [_para("Note text.\n")]}},
+            },
+        }],
+    }
+
+
+def test_get_includes_headers_footers_and_footnotes_in_text(monkeypatch):
+    svc = _FakeDocs(_doc_with_headers_footers_footnotes())
+    monkeypatch.setattr(server.auth, "docs", lambda account: svc)
+    out = server.docs_get("personal", "doc-1")
+    assert out["headers"] == {"h1": "Header text"}
+    assert out["footers"] == {"f1": "Footer text"}
+    assert "See [1] note." in out["text"]
+    assert "[1] Note text." in out["text"]
+
+
+def test_get_includes_headers_footers_and_footnotes_in_markdown(monkeypatch):
+    svc = _FakeDocs(_doc_with_headers_footers_footnotes())
+    monkeypatch.setattr(server.auth, "docs", lambda account: svc)
+    out = server.docs_get("personal", "doc-1", format="markdown")
+    assert out["headers"] == {"h1": "Header text"}
+    assert out["footers"] == {"f1": "Footer text"}
+    assert out["markdown"] == "See [^1] note.\n\n[^1]: Note text."
+
+
+def test_get_reports_pending_suggestions(monkeypatch):
+    doc = _doc_with_headers_footers_footnotes()
+    doc["tabs"][0]["documentTab"]["body"]["content"][0]["paragraph"]["elements"][0]["suggestedInsertionIds"] = ["s1"]
+    svc = _FakeDocs(doc)
+    monkeypatch.setattr(server.auth, "docs", lambda account: svc)
+    out = server.docs_get("personal", "doc-1")
+    assert out["has_pending_suggestions"] is True
 
 
 def test_every_write_is_pinned_to_the_revision_it_read(fake):
