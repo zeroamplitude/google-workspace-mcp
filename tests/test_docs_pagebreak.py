@@ -1,5 +1,6 @@
-"""Page breaks: the `<!-- pagebreak -->` marker in the Markdown compiler, and
-docs_insert's insertPageBreak segment handling, without touching Google."""
+"""Page and section breaks: the `<!-- pagebreak -->` / `<!-- sectionbreak -->`
+markers in the Markdown compiler, and docs_insert's insertPageBreak /
+insertSectionBreak segment handling, without touching Google."""
 
 from __future__ import annotations
 
@@ -85,3 +86,58 @@ def test_replace_section_allows_a_pagebreak_in_the_markdown(monkeypatch):
     }
     assert svc.batches()[1]["requests"] == [{"insertPageBreak": {"location": {"index": 5, "tabId": "t.0"}}}]
     assert out["section"] == "Sec"
+
+
+# ─── split_markdown_tables recognizes the sectionbreak marker ───────────
+
+
+def test_sectionbreak_line_is_its_own_segment():
+    md = "Before\n\n<!-- sectionbreak -->\n\nAfter"
+    segs = docs_markdown.split_markdown_tables(md)
+    assert segs == [("text", "Before\n"), ("sectionbreak", "NEXT_PAGE"), ("text", "\nAfter")]
+
+
+def test_sectionbreak_continuous_variant():
+    assert docs_markdown.split_markdown_tables("<!-- sectionbreak continuous -->") == [("sectionbreak", "CONTINUOUS")]
+
+
+def test_sectionbreak_marker_is_whitespace_and_case_tolerant():
+    for line in ("<!--sectionbreak-->", "  <!-- SectionBreak -->  ", "<!--   sectionbreak   -->"):
+        assert docs_markdown.split_markdown_tables(line) == [("sectionbreak", "NEXT_PAGE")]
+    for line in ("<!--sectionbreak continuous-->", "  <!-- SectionBreak   Continuous -->  "):
+        assert docs_markdown.split_markdown_tables(line) == [("sectionbreak", "CONTINUOUS")]
+
+
+def test_sectionbreak_marker_must_be_alone_on_its_line():
+    md = "<!-- sectionbreak --> and more"
+    assert docs_markdown.split_markdown_tables(md) == [("text", md)]
+
+
+# ─── docs_insert with a section break ────────────────────────────────────
+
+
+def test_insert_sectionbreak_alone_sends_one_insertsectionbreak_request(monkeypatch):
+    doc1 = make_doc(("NORMAL_TEXT", "Hi"))  # body_end 4; "end" mode at index 3
+    svc = _SeqFakeDocs(doc1, doc1)
+    monkeypatch.setattr(server.auth, "docs", lambda account: svc)
+
+    out = server.docs_insert("personal", "doc-1", "<!-- sectionbreak -->")
+
+    assert [n for n, _ in svc.log] == ["get", "batchUpdate", "get"]
+    assert svc.batches()[0] == {
+        "requests": [{"insertSectionBreak": {"sectionType": "NEXT_PAGE", "location": {"index": 3, "tabId": "t.0"}}}],
+        "writeControl": {"requiredRevisionId": "rev-1"},
+    }
+    assert out["inserted_at"] == 3
+
+
+def test_insert_sectionbreak_continuous_sets_the_section_type(monkeypatch):
+    doc1 = make_doc(("NORMAL_TEXT", "Hi"))
+    svc = _SeqFakeDocs(doc1, doc1)
+    monkeypatch.setattr(server.auth, "docs", lambda account: svc)
+
+    server.docs_insert("personal", "doc-1", "<!-- sectionbreak continuous -->")
+
+    assert svc.batches()[0]["requests"] == [
+        {"insertSectionBreak": {"sectionType": "CONTINUOUS", "location": {"index": 3, "tabId": "t.0"}}}
+    ]

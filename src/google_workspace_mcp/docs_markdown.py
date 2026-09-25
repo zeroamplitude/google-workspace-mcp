@@ -21,6 +21,10 @@ with the surrounding text.
 A standalone `<!-- pagebreak -->` line is a page break: like a table, it
 isn't text `insertText` can carry (it needs its own `insertPageBreak`
 request), so `split_markdown_tables` pulls it out the same way.
+
+A standalone `<!-- sectionbreak -->` line is a section break (its own
+`insertSectionBreak` request, `sectionType` NEXT_PAGE), pulled out the same
+way; `<!-- sectionbreak continuous -->` makes it CONTINUOUS instead.
 """
 
 from __future__ import annotations
@@ -171,6 +175,7 @@ def parse_blocks(md: str) -> list[Para]:
 _ROW = re.compile(r"^[ \t]*\|(.*)\|[ \t]*$")
 _SEP_CELL = re.compile(r"^:?-+:?$")
 _PAGEBREAK = re.compile(r"^[ \t]*<!--\s*pagebreak\s*-->[ \t]*$", re.IGNORECASE)
+_SECTIONBREAK = re.compile(r"^[ \t]*<!--\s*sectionbreak(\s+continuous)?\s*-->[ \t]*$", re.IGNORECASE)
 
 
 def _split_row(line: str) -> list[str]:
@@ -195,8 +200,8 @@ def _split_row(line: str) -> list[str]:
 
 
 def split_markdown_tables(md: str) -> list[tuple[str, object]]:
-    """Split `md` into ("text", str), ("table", rows) and ("pagebreak", None)
-    segments, in order.
+    """Split `md` into ("text", str), ("table", rows), ("pagebreak", None)
+    and ("sectionbreak", sectionType) segments, in order.
 
     A table is a GitHub-style pipe table: a `| a | b |` header row, a
     `|---|---|` separator row of the same width (each cell just dashes,
@@ -204,7 +209,9 @@ def split_markdown_tables(md: str) -> list[tuple[str, object]]:
     the header; data rows are padded/truncated to the header's width.
 
     A page break is a standalone `<!-- pagebreak -->` line (its own line,
-    nothing else on it).
+    nothing else on it). A section break is a standalone
+    `<!-- sectionbreak -->` line (sectionType "NEXT_PAGE") or
+    `<!-- sectionbreak continuous -->` ("CONTINUOUS"), same rule.
     """
     lines = md.replace("\r\n", "\n").split("\n")
     segments: list[tuple[str, object]] = []
@@ -220,6 +227,11 @@ def split_markdown_tables(md: str) -> list[tuple[str, object]]:
         if _PAGEBREAK.match(lines[i]):
             flush()
             segments.append(("pagebreak", None))
+            i += 1
+            continue
+        if m := _SECTIONBREAK.match(lines[i]):
+            flush()
+            segments.append(("sectionbreak", "CONTINUOUS" if m.group(1) else "NEXT_PAGE"))
             i += 1
             continue
         header = _ROW.match(lines[i])

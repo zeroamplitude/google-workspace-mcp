@@ -341,6 +341,29 @@ def section_path(sections: list[Section], index: int) -> list[str]:
     return [s.heading for s in sections if s.heading_start <= index < s.contains_end]
 
 
+def sections(body: dict) -> list[dict]:
+    """Document sections (as split by section breaks), each the range
+    docs_page_setup's `updateSectionStyle` targets.
+
+    Every tab body starts with an implicit section break (Google always puts
+    one at index [0, 1)) that governs section 0; `insertSectionBreak` (the
+    `<!-- sectionbreak -->` marker) adds one structural element per further
+    section, each one index wide, right where its own section starts. A
+    section's styled range runs from just after its own break to just before
+    the next one (or the body's end, less the undeletable final newline for
+    the last section)."""
+    end = body_end(body)
+    breaks = [el for el in body.get("content", []) if "sectionBreak" in el]
+    if not breaks:
+        return [{"start_index": 0, "end_index": end - 1}]
+    out = []
+    for i, b in enumerate(breaks):
+        start = b["endIndex"]
+        stop = breaks[i + 1]["startIndex"] if i + 1 < len(breaks) else end - 1
+        out.append({"start_index": start, "end_index": stop})
+    return out
+
+
 def structural_in_range(body: dict, start: int, end: int) -> str | None:
     """Name of the first table / TOC / section break / image in [start, end)."""
     for el in body.get("content", []):
