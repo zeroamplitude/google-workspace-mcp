@@ -2,9 +2,9 @@
 
 Supported: `#`–`######` headings, paragraphs (consecutive lines join),
 **bold** / __bold__, *italic* / _italic_, `code`, [text](url), `-`/`*`/`+`
-bullets, `1.` numbered lists (nested by two-space indent), and ``` fenced
-code blocks (monospace), and `>` quotes (an indented paragraph). Anything
-else is inserted literally.
+bullets, `1.` numbered lists (nested by two-space indent), `- [ ]` / `- [x]`
+checklists (also `*`/`+`), and ``` fenced code blocks (monospace), and `>`
+quotes (an indented paragraph). Anything else is inserted literally.
 
 The text goes in with a single insertText; every other request only styles
 it, so all ranges are computed against the post-insert document. The one
@@ -24,6 +24,7 @@ MONOSPACE = "Roboto Mono"
 _BULLET_PRESET = {
     "bullet": "BULLET_DISC_CIRCLE_SQUARE",
     "number": "NUMBERED_DECIMAL_ALPHA_ROMAN",
+    "check": "BULLET_CHECKBOX",
 }
 # Text-style fields cleared on everything inserted, so new text doesn't
 # inherit the bold/link/font of whatever it was typed next to.
@@ -91,6 +92,7 @@ def parse_inline(s: str, style: dict | None = None) -> list[tuple[str, dict]]:
 # ─── blocks ─────────────────────────────────────────────────────────────
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_CHECK = re.compile(r"^( *)[-*+]\s+\[([ xX])\]\s+(.*)$")
 _BULLET = re.compile(r"^( *)[-*+]\s+(.*)$")
 _NUMBER = re.compile(r"^( *)\d+[.)]\s+(.*)$")
 _FENCE = re.compile(r"^\s*```")
@@ -133,6 +135,15 @@ def parse_blocks(md: str) -> list[Para]:
             flush()
             if m.group(2):
                 paras.append(Para(runs=parse_inline(m.group(2)), style=f"HEADING_{len(m.group(1))}"))
+        elif m := _CHECK.match(line):
+            flush()
+            if m.group(3).strip():
+                # The Docs API has no way to set a checkbox's checked state (createParagraphBullets
+                # only picks the BULLET_CHECKBOX glyph); strikethrough is the visible "done" marker.
+                checked_style = {"strikethrough": True} if m.group(2) in "xX" else None
+                paras.append(
+                    Para(runs=parse_inline(m.group(3), checked_style), list_kind="check", level=len(m.group(1)) // 2)
+                )
         elif (m := _BULLET.match(line)) or (m := _NUMBER.match(line)):
             flush()
             kind = "bullet" if m.re is _BULLET else "number"

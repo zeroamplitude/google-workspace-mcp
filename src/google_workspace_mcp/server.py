@@ -1617,8 +1617,8 @@ def docs_insert(
 
     Markdown supported: # headings, paragraphs, **bold**, *italic*, `code`,
     [links](url), - bullets, 1. numbered lists (indent 2 spaces to nest),
-    ``` code blocks, > quotes (an indented paragraph). Anything else is
-    inserted as literal text.
+    - [ ] / - [x] checklists, ``` code blocks, > quotes (an indented
+    paragraph). Anything else is inserted as literal text.
     """
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
@@ -1736,6 +1736,9 @@ def _rgb(hex_color: str) -> dict:
     return {"color": {"rgbColor": {"red": r, "green": g, "blue": b}}}
 
 
+_ALIGN = {"left": "START", "center": "CENTER", "right": "END", "justify": "JUSTIFIED"}
+
+
 @mcp.tool()
 def docs_format(
     account: AccountSlug,
@@ -1752,6 +1755,11 @@ def docs_format(
     bold: bool | None = None,
     italic: bool | None = None,
     underline: bool | None = None,
+    align: Literal["left", "center", "right", "justify"] | None = None,
+    line_spacing: float | None = None,
+    space_above_pt: float | None = None,
+    space_below_pt: float | None = None,
+    indent_pt: float | None = None,
     match_case: bool = True,
     tab_id: str | None = None,
     revision_id: str | None = None,
@@ -1760,13 +1768,17 @@ def docs_format(
 
     What: `target="heading"` — the heading line itself; `"section"` — the
     text under `heading` (subsections included, heading line excluded);
-    `"text"` — every occurrence of `text`; `"range"` — [start_index,
-    end_index) from docs_get.
+    `"text"` — every occurrence of `text` (paragraph-level params apply to
+    each match's whole paragraph); `"range"` — [start_index, end_index) from
+    docs_get.
 
-    How (set only what should change; the rest is left as is): `color` and
-    `background_color` as hex ('#1a73e8'), `font` as a Google Docs font name
-    ('Georgia', 'Merriweather', 'Roboto Mono' — an unknown name renders as
-    Arial), `size_pt`, and `bold` / `italic` / `underline` true or false.
+    How (set only what should change; the rest is left as is): text style —
+    `color` and `background_color` as hex ('#1a73e8'), `font` as a Google
+    Docs font name ('Georgia', 'Merriweather', 'Roboto Mono' — an unknown
+    name renders as Arial), `size_pt`, and `bold` / `italic` / `underline`
+    true or false. Paragraph style — `align` ('left'/'center'/'right'/
+    'justify'), `line_spacing` (1.0, 1.15, 1.5, 2.0, ...), `space_above_pt` /
+    `space_below_pt`, and `indent_pt` (left indent, first line included).
     """
     style: dict[str, Any] = {}
     if color:
@@ -1782,9 +1794,26 @@ def docs_format(
     for name, value in (("bold", bold), ("italic", italic), ("underline", underline)):
         if value is not None:
             style[name] = value
-    if not style:
+
+    pstyle: dict[str, Any] = {}
+    if align:
+        pstyle["alignment"] = _ALIGN[align]
+    if line_spacing is not None:
+        if line_spacing <= 0:
+            raise ValueError(f"line_spacing must be positive, got {line_spacing}.")
+        pstyle["lineSpacing"] = line_spacing * 100
+    if space_above_pt is not None:
+        pstyle["spaceAbove"] = {"magnitude": space_above_pt, "unit": "PT"}
+    if space_below_pt is not None:
+        pstyle["spaceBelow"] = {"magnitude": space_below_pt, "unit": "PT"}
+    if indent_pt is not None:
+        pstyle["indentStart"] = {"magnitude": indent_pt, "unit": "PT"}
+        pstyle["indentFirstLine"] = {"magnitude": indent_pt, "unit": "PT"}
+
+    if not style and not pstyle:
         raise ValueError("Nothing to change: pass at least one of color, background_color, font, size_pt, "
-                         "bold, italic, underline.")
+                         "bold, italic, underline, align, line_spacing, space_above_pt, space_below_pt, "
+                         "indent_pt.")
 
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
@@ -1792,26 +1821,52 @@ def docs_format(
         if not heading:
             raise ValueError(f'target="{target}" needs `heading`.')
         sec = docs_model.find_section(docs_model.outline(body), heading)
-        ranges = [(sec.heading_start, sec.body_start - 1) if target == "heading" else (sec.body_start, sec.end)]
+        if target == "heading":
+            ranges = [(sec.heading_start, sec.body_start - 1)]
+            para_ranges = [(sec.heading_start, sec.body_start)]
+        else:
+            ranges = [(sec.body_start, sec.end)]
+            para_ranges = ranges
     elif target == "text":
         if not text:
             raise ValueError('target="text" needs `text`.')
         ranges = docs_model.find_all(body, text, match_case)
         if not ranges:
             raise ValueError(f"{text!r} does not appear in this tab.")
+        paras = docs_model.paragraphs(body)
+        para_ranges = []
+        for s, _ in ranges:
+            for p in paras:
+                if p["start_index"] <= s < p["end_index"]:
+                    pr = (p["start_index"], p["end_index"])
+                    if pr not in para_ranges:
+                        para_ranges.append(pr)
+                    break
     else:
         if start_index is None or end_index is None or not 1 <= start_index < end_index:
             raise ValueError('target="range" needs 1 <= start_index < end_index.')
         ranges = [(start_index, end_index)]
+        para_ranges = ranges
+
+    def _rng(s: int, e: int) -> dict:
+        r: dict[str, Any] = {"startIndex": s, "endIndex": e}
+        if tab["tab_id"]:
+            r["tabId"] = tab["tab_id"]
+        return r
 
     reqs = []
-    for s, e in ranges:
-        if e <= s:
-            continue  # an empty section
-        rng: dict[str, Any] = {"startIndex": s, "endIndex": e}
-        if tab["tab_id"]:
-            rng["tabId"] = tab["tab_id"]
-        reqs.append({"updateTextStyle": {"range": rng, "textStyle": style, "fields": ",".join(style)}})
+    if style:
+        for s, e in ranges:
+            if e <= s:
+                continue  # an empty section
+            reqs.append({"updateTextStyle": {"range": _rng(s, e), "textStyle": style, "fields": ",".join(style)}})
+    if pstyle:
+        for s, e in para_ranges:
+            if e <= s:
+                continue  # an empty paragraph range
+            reqs.append({
+                "updateParagraphStyle": {"range": _rng(s, e), "paragraphStyle": pstyle, "fields": ",".join(pstyle)}
+            })
     if not reqs:
         raise ValueError("The target is empty; there is no text to format.")
     return {"ranges": [list(r) for r in ranges], **_docs_batch(account, document_id, reqs, revision)}

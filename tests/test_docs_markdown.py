@@ -132,6 +132,46 @@ def test_inline_splice_keeps_surrounding_spaces():
     assert _text_styles(reqs) == [(12, 16, {"bold": True})]
 
 
+def test_checklist_parses_as_check_items_and_strikes_through_done_ones():
+    paras = parse_blocks("- [ ] todo\n- [x] done\n* [X] also done\n+ [ ] more")
+    assert [(p.list_kind, p.level, p.text) for p in paras] == [
+        ("check", 0, "todo"),
+        ("check", 0, "done"),
+        ("check", 0, "also done"),
+        ("check", 0, "more"),
+    ]
+    assert paras[0].runs == [("todo", {})]
+    assert paras[1].runs == [("done", {"strikethrough": True})]
+    assert paras[2].runs == [("also done", {"strikethrough": True})]
+
+
+def test_checklist_strikethrough_combines_with_nested_styles():
+    [p] = parse_blocks("- [x] **bold** done")
+    assert p.runs == [("bold", {"strikethrough": True, "bold": True}), (" done", {"strikethrough": True})]
+
+
+def test_checklist_renders_with_the_checkbox_bullet_preset():
+    reqs = markdown_to_requests("- [ ] a\n- [x] b", 1, "paragraph")
+    bullets = [r["createParagraphBullets"] for r in reqs if "createParagraphBullets" in r]
+    assert [(b["range"]["startIndex"], b["range"]["endIndex"], b["bulletPreset"]) for b in bullets] == [
+        (1, 5, "BULLET_CHECKBOX"),
+    ]
+    # The [x] item's text carries a strikethrough updateTextStyle.
+    assert (3, 4, {"strikethrough": True}) in _text_styles(reqs)
+
+
+def test_checklist_items_group_separately_from_bullets():
+    reqs = markdown_to_requests("- a\n- [ ] b\n- [x] c\n- d", 1, "paragraph")
+    bullets = [r["createParagraphBullets"] for r in reqs if "createParagraphBullets" in r]
+    presets = [(b["range"]["startIndex"], b["range"]["endIndex"], b["bulletPreset"]) for b in bullets]
+    # Three separate runs: bullet "a", check "b"+"c", bullet "d" — reversed (last list first).
+    assert presets == [
+        (7, 9, "BULLET_DISC_CIRCLE_SQUARE"),
+        (3, 7, "BULLET_CHECKBOX"),
+        (1, 3, "BULLET_DISC_CIRCLE_SQUARE"),
+    ]
+
+
 def test_quote_becomes_an_indented_paragraph():
     paras = parse_blocks("before\n> quoted line one\n> line two\n>\n> second\nafter")
     assert [(p.text, p.indent) for p in paras] == [
