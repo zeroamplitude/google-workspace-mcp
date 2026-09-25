@@ -14,7 +14,7 @@ import mimetypes
 import re
 from email.message import EmailMessage
 from email.utils import formataddr, parseaddr, parsedate_to_datetime
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,7 +22,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from mcp.server.fastmcp import FastMCP
 
-from . import auth
+from . import auth, docs_markdown, docs_model
 from .accounts import ACCOUNTS, AccountSlug, email_for, name_for
 
 mcp = FastMCP("google-workspace")
@@ -1353,6 +1353,577 @@ def drive_file_link_access(
         supportsAllDrives=True,
     ).execute()
     return {"file_id": file_id, "link_access": "off"}
+
+
+# Comments live on the Drive file, so these work on any file type. For a
+# Google Doc, each comment is also tagged with the section (heading path) its
+# quoted text falls in, found by locating the quote in the document.
+
+_COMMENT_FIELDS = (
+    "id, content, author(displayName, emailAddress), createdTime, modifiedTime, "
+    "resolved, deleted, quotedFileContent, "
+    "replies(id, content, author(displayName, emailAddress), createdTime, action, deleted)"
+)
+_REPLY_FIELDS = "id, content, author(displayName, emailAddress), createdTime, action"
+_GOOGLE_DOC = "application/vnd.google-apps.document"
+
+
+def _person(a: dict | None) -> str | None:
+    if not a:
+        return None
+    name, email = a.get("displayName"), a.get("emailAddress")
+    return f"{name} <{email}>" if name and email else name or email
+
+
+def _comment_row(c: dict) -> dict:
+    quoted = (c.get("quotedFileContent") or {}).get("value")
+    return {
+        "id": c["id"],
+        "author": _person(c.get("author")),
+        "content": c.get("content"),
+        "created_time": c.get("createdTime"),
+        "resolved": bool(c.get("resolved")),
+        "quoted_text": unescape(quoted) if quoted else None,
+        "replies": [
+            {
+                "id": r["id"],
+                "author": _person(r.get("author")),
+                "content": r.get("content"),
+                "created_time": r.get("createdTime"),
+                **({"action": r["action"]} if r.get("action") else {}),
+            }
+            for r in c.get("replies", [])
+            if not r.get("deleted")
+        ],
+    }
+
+
+def _tag_sections(account: str, file_id: str, rows: list[dict]) -> None:
+    """Add `section` (innermost heading), `section_path` and `tab_id` to each row."""
+    doc = auth.docs(account).documents().get(documentId=file_id, includeTabsContent=True).execute()
+    tabs = [(t, docs_model.outline(t["body"])) for t in docs_model.flatten_tabs(doc)]
+    for row in rows:
+        row.update(section=None, section_path=[], tab_id=None)
+        if not row["quoted_text"]:
+            continue
+        for tab, sections in tabs:
+            at = docs_model.locate_quote(tab["body"], row["quoted_text"])
+            if at is not None:
+                path = docs_model.section_path(sections, at)
+                row.update(section=path[-1] if path else None, section_path=path, tab_id=tab["tab_id"])
+                break
+
+
+@mcp.tool()
+def drive_comment_list(
+    account: AccountSlug,
+    file_id: str,
+    include_resolved: bool = False,
+    heading: str | None = None,
+) -> dict:
+    """List the comments on a file, with their replies and the text each quotes.
+
+    Open comments only unless `include_resolved`. For a Google Doc each
+    comment also carries `section` (the heading it sits under) and
+    `section_path` (outermost heading first); pass `heading` to keep only
+    comments inside that heading's section, subsections included. A comment
+    whose quoted text was since edited away has `section: null`.
+    """
+    svc = auth.drive(account).comments()
+    comments: list[dict] = []
+    token = None
+    while True:
+        resp = svc.list(
+            fileId=file_id,
+            includeDeleted=False,
+            pageSize=100,
+            pageToken=token,
+            fields=f"nextPageToken, comments({_COMMENT_FIELDS})",
+        ).execute()
+        comments.extend(resp.get("comments", []))
+        token = resp.get("nextPageToken")
+        if not token:
+            break
+    rows = [
+        _comment_row(c)
+        for c in comments
+        if not c.get("deleted") and (include_resolved or not c.get("resolved"))
+    ]
+
+    mime = (
+        auth.drive(account).files().get(fileId=file_id, fields="mimeType", supportsAllDrives=True).execute()
+    ).get("mimeType")
+    if mime == _GOOGLE_DOC:
+        _tag_sections(account, file_id, rows)
+        if heading is not None:
+            key = docs_model.norm(heading)
+            rows = [r for r in rows if any(docs_model.norm(h) == key for h in r["section_path"])]
+    elif heading is not None:
+        raise ValueError("`heading` filtering needs a Google Doc; this file is " + str(mime))
+    return {"file_id": file_id, "comments": rows}
+
+
+@mcp.tool()
+def drive_comment_reply(account: AccountSlug, file_id: str, comment_id: str, content: str) -> dict:
+    """Reply to an existing comment. The reply is posted as this account and
+    notifies the thread's participants the way a reply in the Docs UI does."""
+    return (
+        auth.drive(account)
+        .replies()
+        .create(fileId=file_id, commentId=comment_id, body={"content": content}, fields=_REPLY_FIELDS)
+        .execute()
+    )
+
+
+@mcp.tool()
+def drive_comment_resolve(
+    account: AccountSlug,
+    file_id: str,
+    comment_id: str,
+    resolved: bool = True,
+    content: str | None = None,
+) -> dict:
+    """Resolve a comment thread (or reopen it with resolved=false), optionally
+    leaving `content` as a closing reply in the same step."""
+    body: dict[str, Any] = {"action": "resolve" if resolved else "reopen"}
+    if content:
+        body["content"] = content
+    return (
+        auth.drive(account)
+        .replies()
+        .create(fileId=file_id, commentId=comment_id, body=body, fields=_REPLY_FIELDS)
+        .execute()
+    )
+
+
+# ─── Docs (in-place editing) ────────────────────────────────────────────
+
+# Edits go through the Docs API's batchUpdate, so they change the live
+# document — formatting, comments and revision history elsewhere in it are
+# left alone — instead of replacing the whole file the way
+# drive_file_update_content does.
+#
+# Every write is pinned to the revision it was computed against
+# (writeControl.requiredRevisionId): if someone edits the document between
+# the read and the write, Google rejects the write rather than applying it at
+# indices that no longer point where they did.
+
+
+def _docs_load(account: str, document_id: str, tab_id: str | None, revision_id: str | None):
+    """Fetch the document; refuse if it moved on from `revision_id`."""
+    try:
+        doc = auth.docs(account).documents().get(documentId=document_id, includeTabsContent=True).execute()
+    except HttpError as e:
+        if e.resp.status == 400:
+            raise ValueError(
+                f"{document_id} is not a Google Doc (the Docs API can't open it). Convert it first, "
+                "e.g. drive_file_upload with convert_to_google_doc=True, then edit the converted copy."
+            ) from e
+        raise
+    current = doc.get("revisionId")
+    if revision_id and current and revision_id != current:
+        raise ValueError(
+            f"The document changed since revision {revision_id} (now {current}). "
+            "Call docs_get again and redo the edit against the current text."
+        )
+    return doc, docs_model.resolve_tab(doc, tab_id), current
+
+
+def _docs_batch(account: str, document_id: str, requests: list[dict], revision_id: str | None) -> dict:
+    body: dict[str, Any] = {"requests": requests}
+    if revision_id:
+        body["writeControl"] = {"requiredRevisionId": revision_id}
+    resp = auth.docs(account).documents().batchUpdate(documentId=document_id, body=body).execute()
+    return {
+        "document_id": document_id,
+        "revision_id": (resp.get("writeControl") or {}).get("requiredRevisionId"),
+        "requests_applied": len(requests),
+        "replies": resp.get("replies", []),
+    }
+
+
+def _insert_index(body: dict, at: str, heading: str | None, index: int | None) -> int:
+    """Resolve docs_insert's `at` / `heading` / `index` to a document index."""
+    end = docs_model.body_end(body)
+    if at == "end":
+        return end - 1
+    if at == "start":
+        return next((p["start_index"] for p in docs_model.paragraphs(body)), end - 1)
+    if at == "after_heading":
+        if not heading:
+            raise ValueError('at="after_heading" needs `heading`.')
+        return docs_model.find_section(docs_model.outline(body), heading).end
+    if index is None:
+        raise ValueError('at="index" needs `index`.')
+    if not 1 <= index < end:
+        raise ValueError(f"index must be between 1 and {end - 1} for this tab, got {index}.")
+    return index
+
+
+@mcp.tool()
+def docs_get(
+    account: AccountSlug,
+    document_id: str,
+    tab_id: str | None = None,
+    include_paragraphs: bool = False,
+) -> dict:
+    """Read a Google Doc for editing: its text, tabs, and heading outline.
+
+    Returns `revision_id` (pass it to the edit tools so they refuse to write
+    over a newer version), `tabs`, the chosen tab's `text`, and `outline` —
+    every heading with its `level` (0 = Title, 1-6), `start_index`,
+    `body_start_index` and `end_index` (the section's extent, subsections
+    included). `include_paragraphs` adds every top-level paragraph with its
+    index range, for exact edits with docs_delete_range / docs_insert(index=).
+    Indices are per tab; without `tab_id` the first tab is used.
+    """
+    doc, tab, revision = _docs_load(account, document_id, tab_id, None)
+    body = tab["body"]
+    out = {
+        "document_id": document_id,
+        "title": doc.get("title"),
+        "revision_id": revision,
+        "tab_id": tab["tab_id"],
+        "tabs": [
+            {"tab_id": t["tab_id"], "title": t["title"], "depth": t["depth"]}
+            for t in docs_model.flatten_tabs(doc)
+        ],
+        "body_end_index": docs_model.body_end(body),
+        "outline": [s.as_dict() for s in docs_model.outline(body)],
+        "text": docs_model.plain_text(body),
+    }
+    if include_paragraphs:
+        out["paragraphs"] = docs_model.paragraphs(body)
+    return out
+
+
+@mcp.tool()
+def docs_insert(
+    account: AccountSlug,
+    document_id: str,
+    markdown: str,
+    at: Literal["end", "start", "after_heading", "index"] = "end",
+    heading: str | None = None,
+    index: int | None = None,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Insert Markdown into a Google Doc in place, styled as Docs formatting.
+
+    Where: `at="end"` / `"start"` of the tab; `"after_heading"` puts it at the
+    end of `heading`'s section (after any subsections); `"index"` at an
+    explicit `index` from docs_get — a paragraph's start_index adds whole
+    paragraphs there, any other index splices the text inline.
+
+    Markdown supported: # headings, paragraphs, **bold**, *italic*, `code`,
+    [links](url), - bullets, 1. numbered lists (indent 2 spaces to nest),
+    ``` code blocks, > quotes (an indented paragraph). Anything else is
+    inserted as literal text.
+    """
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    idx = _insert_index(body, at, heading, index)
+    mode = docs_model.insertion_mode(body, idx)
+    reqs = docs_markdown.markdown_to_requests(markdown, idx, mode, tab["tab_id"])
+    return {"inserted_at": idx, **_docs_batch(account, document_id, reqs, revision)}
+
+
+@mcp.tool()
+def docs_replace_section(
+    account: AccountSlug,
+    document_id: str,
+    heading: str,
+    markdown: str,
+    keep_heading: bool = True,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Rewrite everything under a heading, in place, with Markdown.
+
+    The section runs from the heading to the next heading of the same or a
+    higher level, so its subsections are replaced too. `keep_heading=False`
+    replaces the heading line as well (include a new # heading in `markdown`
+    to rename it). The heading must match exactly one heading (case and
+    spacing ignored). Refuses a section holding a table, image, table of
+    contents or section break — remove those deliberately with
+    docs_delete_range, or edit around them with docs_replace_text /
+    docs_insert. Comments anchored to the replaced text lose their anchor.
+    Markdown support is as for docs_insert.
+    """
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    end = docs_model.body_end(body)
+    section = docs_model.find_section(docs_model.outline(body), heading)
+    start = section.body_start if keep_heading else section.heading_start
+    stop = section.end
+    loc_tab = tab["tab_id"]
+
+    reqs: list[dict] = []
+    if stop > start:
+        blocker = docs_model.structural_in_range(body, start, stop)
+        if blocker:
+            raise ValueError(
+                f"The section {section.heading!r} contains a {blocker}; replacing it would delete that too. "
+                "Use docs_delete_range to remove it deliberately, or docs_replace_text / docs_insert instead."
+            )
+        rng = {"startIndex": start, "endIndex": stop}
+        if loc_tab:
+            rng["tabId"] = loc_tab
+        reqs.append({"deleteContentRange": {"range": rng}})
+        idx, mode = start, ("end_empty" if stop == end - 1 else "paragraph")
+    else:  # empty section and the heading is the tab's last paragraph
+        idx, mode = end - 1, "end"
+    reqs += docs_markdown.markdown_to_requests(markdown, idx, mode, loc_tab)
+    return {
+        "section": section.heading,
+        "replaced_range": [start, stop],
+        **_docs_batch(account, document_id, reqs, revision),
+    }
+
+
+@mcp.tool()
+def docs_replace_text(
+    account: AccountSlug,
+    document_id: str,
+    find: str,
+    replace: str,
+    match_case: bool = True,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Find and replace plain text everywhere in a Google Doc (or one tab),
+    in place. The replacement keeps the formatting of the text it replaces.
+    Returns `occurrences_changed`; 0 means nothing matched."""
+    req: dict[str, Any] = {
+        "containsText": {"text": find, "matchCase": match_case},
+        "replaceText": replace,
+    }
+    if tab_id:
+        req["tabsCriteria"] = {"tabIds": [tab_id]}
+    out = _docs_batch(account, document_id, [{"replaceAllText": req}], revision_id)
+    changed = sum((r.get("replaceAllText") or {}).get("occurrencesChanged", 0) for r in out["replies"])
+    return {**out, "occurrences_changed": changed}
+
+
+@mcp.tool()
+def docs_delete_range(
+    account: AccountSlug,
+    document_id: str,
+    start_index: int,
+    end_index: int,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Delete [start_index, end_index) from a Google Doc, in place. Take the
+    indices from docs_get (outline or include_paragraphs) and pass its
+    `revision_id` so a stale range is refused. A tab's final newline
+    (body_end_index - 1) can't be deleted."""
+    if not 1 <= start_index < end_index:
+        raise ValueError(f"Need 1 <= start_index < end_index, got [{start_index}, {end_index}).")
+    rng: dict[str, Any] = {"startIndex": start_index, "endIndex": end_index}
+    if tab_id:
+        rng["tabId"] = tab_id
+    return _docs_batch(account, document_id, [{"deleteContentRange": {"range": rng}}], revision_id)
+
+
+def _rgb(hex_color: str) -> dict:
+    h = hex_color.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6 or any(c not in "0123456789abcdefABCDEF" for c in h):
+        raise ValueError(f"Colors are hex, like '#1a73e8' or '#e33'; got {hex_color!r}.")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return {"color": {"rgbColor": {"red": r, "green": g, "blue": b}}}
+
+
+@mcp.tool()
+def docs_format(
+    account: AccountSlug,
+    document_id: str,
+    target: Literal["heading", "section", "text", "range"],
+    heading: str | None = None,
+    text: str | None = None,
+    start_index: int | None = None,
+    end_index: int | None = None,
+    color: str | None = None,
+    background_color: str | None = None,
+    font: str | None = None,
+    size_pt: float | None = None,
+    bold: bool | None = None,
+    italic: bool | None = None,
+    underline: bool | None = None,
+    match_case: bool = True,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Change the look of existing text in a Google Doc, in place.
+
+    What: `target="heading"` — the heading line itself; `"section"` — the
+    text under `heading` (subsections included, heading line excluded);
+    `"text"` — every occurrence of `text`; `"range"` — [start_index,
+    end_index) from docs_get.
+
+    How (set only what should change; the rest is left as is): `color` and
+    `background_color` as hex ('#1a73e8'), `font` as a Google Docs font name
+    ('Georgia', 'Merriweather', 'Roboto Mono' — an unknown name renders as
+    Arial), `size_pt`, and `bold` / `italic` / `underline` true or false.
+    """
+    style: dict[str, Any] = {}
+    if color:
+        style["foregroundColor"] = _rgb(color)
+    if background_color:
+        style["backgroundColor"] = _rgb(background_color)
+    if font:
+        style["weightedFontFamily"] = {"fontFamily": font}
+    if size_pt is not None:
+        if size_pt <= 0:
+            raise ValueError(f"size_pt must be positive, got {size_pt}.")
+        style["fontSize"] = {"magnitude": size_pt, "unit": "PT"}
+    for name, value in (("bold", bold), ("italic", italic), ("underline", underline)):
+        if value is not None:
+            style[name] = value
+    if not style:
+        raise ValueError("Nothing to change: pass at least one of color, background_color, font, size_pt, "
+                         "bold, italic, underline.")
+
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    if target in ("heading", "section"):
+        if not heading:
+            raise ValueError(f'target="{target}" needs `heading`.')
+        sec = docs_model.find_section(docs_model.outline(body), heading)
+        ranges = [(sec.heading_start, sec.body_start - 1) if target == "heading" else (sec.body_start, sec.end)]
+    elif target == "text":
+        if not text:
+            raise ValueError('target="text" needs `text`.')
+        ranges = docs_model.find_all(body, text, match_case)
+        if not ranges:
+            raise ValueError(f"{text!r} does not appear in this tab.")
+    else:
+        if start_index is None or end_index is None or not 1 <= start_index < end_index:
+            raise ValueError('target="range" needs 1 <= start_index < end_index.')
+        ranges = [(start_index, end_index)]
+
+    reqs = []
+    for s, e in ranges:
+        if e <= s:
+            continue  # an empty section
+        rng: dict[str, Any] = {"startIndex": s, "endIndex": e}
+        if tab["tab_id"]:
+            rng["tabId"] = tab["tab_id"]
+        reqs.append({"updateTextStyle": {"range": rng, "textStyle": style, "fields": ",".join(style)}})
+    if not reqs:
+        raise ValueError("The target is empty; there is no text to format.")
+    return {"ranges": [list(r) for r in ranges], **_docs_batch(account, document_id, reqs, revision)}
+
+
+# The Docs API only takes an image by URL, which Google fetches once and
+# stores inside the document. Docs' own limits: PNG, JPEG or GIF, under 50 MB.
+_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif"}
+_IMAGE_CAP = 50 * 1024 * 1024
+
+
+@mcp.tool()
+def docs_insert_image(
+    account: AccountSlug,
+    document_id: str,
+    image_url: str | None = None,
+    local_path: str | None = None,
+    at: Literal["end", "start", "after_heading", "index"] = "end",
+    heading: str | None = None,
+    index: int | None = None,
+    width_pt: float | None = None,
+    height_pt: float | None = None,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Insert an image into a Google Doc, in place — PNG, JPEG or GIF.
+
+    Source: `image_url` (must be publicly fetchable) or `local_path`. A local
+    file is uploaded to Drive and made link-readable only for the moment
+    Google takes its copy; link access is then revoked and the upload
+    trashed — the image lives on inside the document.
+
+    Placement as for docs_insert; at a paragraph boundary or the end the
+    image gets a paragraph of its own, at any other index it sits inline.
+    Give `width_pt` or `height_pt` alone to keep the aspect ratio
+    (a page body is about 468pt wide).
+    """
+    if (image_url is None) == (local_path is None):
+        raise ValueError("Pass exactly one of image_url or local_path.")
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    idx = _insert_index(body, at, heading, index)
+    mode = docs_model.insertion_mode(body, idx)
+    t = tab["tab_id"]
+
+    def loc(i: int) -> dict:
+        return {"index": i, **({"tabId": t} if t else {})}
+
+    # Give the image its own paragraph unless it's being spliced inline.
+    reqs: list[dict] = []
+    if mode == "paragraph":
+        reqs.append({"insertText": {"text": "\n", "location": loc(idx)}})
+        img_at = idx
+    elif mode == "end":
+        reqs.append({"insertText": {"text": "\n", "location": loc(idx)}})
+        img_at = idx + 1
+    else:
+        img_at = idx
+
+    size: dict[str, Any] = {}
+    if width_pt:
+        size["width"] = {"magnitude": width_pt, "unit": "PT"}
+    if height_pt:
+        size["height"] = {"magnitude": height_pt, "unit": "PT"}
+
+    def insert(uri: str) -> dict:
+        image: dict[str, Any] = {"uri": uri, "location": loc(img_at)}
+        if size:
+            image["objectSize"] = size
+        styled: list[dict] = [{"insertInlineImage": image}]
+        if mode != "inline":
+            # The new paragraph inherits the style of the one it was split
+            # from (a heading, a list item); make it a plain paragraph.
+            rng = {"startIndex": img_at, "endIndex": img_at + 2, **({"tabId": t} if t else {})}
+            styled += [
+                {"deleteParagraphBullets": {"range": rng}},
+                {"updateParagraphStyle": {
+                    "range": rng,
+                    "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    "fields": "namedStyleType,indentStart,indentFirstLine",
+                }},
+            ]
+        return _docs_batch(account, document_id, [*reqs, *styled], revision)
+
+    if image_url:
+        out = insert(image_url)
+    else:
+        path = _local_file(local_path)
+        mime, _ = mimetypes.guess_type(str(path))
+        if mime not in _IMAGE_TYPES:
+            raise ValueError(f"Docs takes PNG, JPEG or GIF images; {path.name} is {mime or 'unknown'}.")
+        if path.stat().st_size > _IMAGE_CAP:
+            raise ValueError(f"{path.name} is over Docs' 50 MB image limit.")
+        files = auth.drive(account).files()
+        perms = auth.drive(account).permissions()
+        up = files.create(
+            body={"name": f"(temporary image for a Doc) {path.name}"},
+            media_body=MediaFileUpload(str(path), mimetype=mime),
+            fields="id",
+        ).execute()
+        try:
+            perms.create(fileId=up["id"], body={"type": "anyone", "role": "reader"}).execute()
+            out = insert(f"https://drive.usercontent.google.com/download?id={up['id']}&export=download")
+        finally:
+            # The document now holds its own copy; don't leave the upload exposed.
+            try:
+                perms.delete(fileId=up["id"], permissionId="anyoneWithLink").execute()
+            except HttpError:
+                pass  # never shared (the create above failed); trashing still follows
+            files.update(fileId=up["id"], body={"trashed": True}).execute()
+    reply = next((r["insertInlineImage"] for r in out["replies"] if r.get("insertInlineImage")), {})
+    return {"inserted_at": img_at, "object_id": reply.get("objectId"), **out}
 
 
 # ─── Tasks (Google Tasks) ────────────────────────────────────────────────

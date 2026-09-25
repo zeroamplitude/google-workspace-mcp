@@ -10,6 +10,67 @@ only when it is bumped.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-25
+
+### Added
+
+- Google Docs editing **in place**, through the Docs API: `docs_get` (text,
+  tabs, revision and a heading outline with each section's index range),
+  `docs_insert` (at the start or end, after a heading's section, or at an
+  index), `docs_replace_section` (rewrite everything under a heading),
+  `docs_replace_text` (find and replace), `docs_delete_range`, and
+  `docs_format` (colour, highlight, font, size, bold/italic/underline for a
+  heading, a section, every occurrence of some text, or a range), and
+  `docs_insert_image` (a PNG, JPEG or GIF from a URL or a local file).
+- `docs_insert` and `docs_replace_section` take **Markdown** and apply it as
+  native Docs formatting: headings, bold, italic, code, links, bulleted and
+  numbered lists (nested by indent), code blocks, and `>` quotes as
+  indented paragraphs.
+- Comments: `drive_comment_list` returns a file's comments with their replies
+  and quoted text, and on a Google Doc tags each with the section (heading
+  path) it sits in — `heading=` lists one section's. `drive_comment_reply`
+  answers a thread; `drive_comment_resolve` resolves or reopens one.
+
+### Why
+
+The only way to change a Doc was to export it, edit the copy and upload it
+over the original, which rewrote the whole file. Editing now touches only the
+text being changed, so formatting, comments and history elsewhere in the
+document survive, and people's comments can be read and answered by section.
+
+### Safety
+
+- Every write is pinned to the revision it was computed against
+  (`writeControl.requiredRevisionId`), so an edit someone made in the meantime
+  makes the call fail instead of landing at stale indices. Passing
+  `revision_id` from `docs_get` extends that back to when the text was read.
+- `docs_replace_section` refuses a section that holds a table, image, table
+  of contents or section break rather than deleting it with the text, and
+  refuses a heading that matches more than one section.
+- Offsets are counted in UTF-16 code units, as the Docs API does, so emoji and
+  other non-BMP characters don't shift edits.
+
+### Fixed
+
+- An account authorized before 0.12.0 stopped working entirely: the token was
+  refreshed asking for the contacts scopes it was never granted, and Google
+  rejected the whole refresh with `invalid_scope` — Gmail, Calendar, Drive and
+  Tasks included, contrary to 0.12.0's upgrade note. Tokens now refresh with
+  the scopes they were granted, so only the calls needing a missing scope fail,
+  and `accounts_list` reports `missing_scopes` for such an account instead of
+  calling it revoked.
+
+### Not yet
+
+- Creating new comments. The Drive API can't anchor a comment to highlighted
+  text in a Google Doc; that is deferred to a later release.
+
+### Upgrading
+
+**Enable the Google Docs API** in the Google Cloud project behind your OAuth
+client. No new scope and no re-authorization: the Docs API accepts the
+`drive` scope every account already has.
+
 ## [0.12.0] - 2026-09-20
 
 ### Added

@@ -22,7 +22,7 @@ A **multi-account** Google Workspace MCP server for [Claude Code](https://code.c
 - **Per-project access control.** Accounts are configured at *runtime*, never baked into code. Each project's `.mcp.json` scopes it to a subset, so a personal project never even sees your work account.
 - **Your own OAuth client.** You bring a (free) Google Cloud OAuth client, so you own the access and get the full tool surface — including things the default `claude.ai` connector can't do, like deleting a draft. Nothing is routed through anyone else's infrastructure.
 - **Secrets stay out of the tree.** The OAuth client and per-account refresh tokens live under `~/.config/google-workspace-mcp/` (written `0600`), never next to code.
-- **48 tools across five services** — see the [catalog](#tools) below.
+- **58 tools across six services** — see the [catalog](#tools) below.
 
 ## Table of contents
 
@@ -82,7 +82,7 @@ Requires [`uv`](https://docs.astral.sh/uv/) on your PATH. The `/google-workspace
 Each user creates their own client (free):
 
 1. Go to the [Google Cloud Console](https://console.cloud.google.com) and create a project (or pick one).
-2. **APIs & Services → Enabled APIs & services → + Enable APIs** — enable the **Gmail**, **Google Calendar**, **Google Drive**, and **Google Tasks** APIs.
+2. **APIs & Services → Enabled APIs & services → + Enable APIs** — enable the **Gmail**, **Google Calendar**, **Google Drive**, **Google Docs**, and **Google Tasks** APIs.
 3. **APIs & Services → OAuth consent screen** (newer consoles: **Google Auth Platform**) — user type / audience **External**. Fill the required fields. Adding **Test users** is optional: it only matters while the app stays in *Testing*, which the next step ends.
 4. **Publish the app** — **Google Auth Platform → Audience → Publish app**, moving it from *Testing* to **In production**. Don't skip this. Google issues a refresh token that **expires after 7 days** to any External app left in *Testing*, unless the app asks only for name, email address, and profile ([Refresh token expiration](https://developers.google.com/identity/protocols/oauth2#expiration)). This server asks for full Gmail, Calendar, Drive, and Tasks [scopes](#scopes), so in *Testing* every connected account dies about weekly with `invalid_grant: Bad Request` — see [Troubleshooting](#troubleshooting).
    - **Verification is not required.** Publishing does not put you through Google's app-verification review for personal use under 100 users; verification is what lifts that 100-user cap ([Google's docs](https://support.google.com/cloud/answer/13464323)).
@@ -225,6 +225,27 @@ Every call requires an `account` slug. `accounts_list` shows the configured acco
 | `drive_folder_create` | Create a folder. |
 | `drive_file_share` | Share with someone by email — role from `reader` to `organizer`, optional notification message. |
 | `drive_file_link_access` | Toggle "anyone with the link" access on a file the account owns, and return a direct download URL — enable, hand off, revoke. |
+| `drive_comment_list` | Comments on a file with their replies and quoted text. On a Google Doc each is tagged with the **section** (heading path) it sits in; `heading=` lists just one section's. Open comments only unless `include_resolved`. |
+| `drive_comment_reply` | Reply to an existing comment thread. |
+| `drive_comment_resolve` | Resolve a thread (or reopen it), optionally with a closing reply. |
+
+### Docs
+
+Edits change the live Google Doc through the Docs API — the rest of the document, its formatting, comments and history are untouched — rather than replacing the file the way `drive_file_update_content` does.
+
+| Tool | What it does |
+|---|---|
+| `docs_get` | Text, tabs, `revision_id` and a heading **outline** with each section's index range — how Claude finds where to edit. |
+| `docs_insert` | Insert **Markdown** (headings, bold/italic, code, links, bullets, numbered lists, code blocks, `>` indented paragraphs) as native Docs formatting — at the start or end, after a heading's section, or at an index. |
+| `docs_replace_section` | Rewrite everything under a heading with Markdown. Refuses a section holding a table, image, TOC or section break rather than deleting it. |
+| `docs_replace_text` | Find and replace across the document or one tab; keeps the replaced text's formatting. |
+| `docs_delete_range` | Delete an exact index range from `docs_get`. |
+| `docs_format` | Restyle existing text — **colour**, highlight, **font**, size, bold/italic/underline — for a heading line, a whole section, every occurrence of some text, or an index range. `background_color` is the highlight. |
+| `docs_insert_image` | Insert a PNG/JPEG/GIF from a URL or a local file, placed like `docs_insert`, optionally sized. A local file is shared on Drive only while Google copies it into the Doc, then unshared and trashed. |
+
+Every write is pinned to the revision it was computed from, so an edit a person made in the meantime makes the call fail instead of landing at the wrong place. Pass `revision_id` from `docs_get` to extend that guarantee back to when Claude read the text.
+
+> New comments aren't created yet: the Drive API can't anchor a comment to highlighted text in a Google Doc, so that is deferred until it can be done properly.
 
 ### Tasks
 
@@ -278,6 +299,8 @@ Broad on purpose — these are your own accounts; narrower scopes would force a 
 
 > Adding a scope (as v0.3.0 did for Tasks, and v0.12.0 for Contacts) requires re-running `google-workspace-authorize <slug>` for each account. **v0.12.0 also needs the People API enabled** in the Google Cloud project behind your OAuth client — without it every contacts call returns `SERVICE_DISABLED`.
 
+> Docs editing (v0.13.0) needs no new scope — the Docs API accepts `drive` — but the **Google Docs API must be enabled** in your Cloud project, or every `docs_*` call returns `SERVICE_DISABLED`.
+
 > The two contact scopes are deliberately the read-only pair: this server never writes a contact.
 
 > Being this far past Google's name/email/profile exemption is also why the OAuth app **must be published** rather than left in *Testing* — see [setup step 4](#1-create-your-own-google-cloud-oauth-client).
@@ -321,7 +344,9 @@ google-workspace-mcp/
 ├── commands/
 │   └── google-workspace-setup.md    # /google-workspace-setup — guided setup
 ├── src/google_workspace_mcp/
-│   ├── server.py                    # the MCP server — all 48 tools
+│   ├── server.py                    # the MCP server — all 58 tools
+│   ├── docs_model.py                # Docs JSON → outline, sections, UTF-16 indices
+│   ├── docs_markdown.py             # Markdown → Docs batchUpdate requests
 │   ├── auth.py                      # token load/refresh + Google service builders
 │   ├── accounts.py                  # runtime account registry + GWM_ACCOUNTS scoping
 │   └── authorize.py                 # standalone OAuth consent flow (CLI)

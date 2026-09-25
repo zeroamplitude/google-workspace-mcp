@@ -73,7 +73,11 @@ def _load_credentials(slug: str) -> Credentials:
             f"No token for account '{slug}' ({email_for(slug)}). "
             f"Run: google-workspace-authorize {slug}"
         )
-    creds = Credentials.from_authorized_user_file(str(path), SCOPES)
+    # Refresh with the scopes this token was granted, not SCOPES: asking for
+    # one added since consent (0.12.0's contacts scopes, say) makes Google
+    # reject the whole refresh with invalid_scope, taking every service down.
+    # A missing scope then fails only the calls that need it.
+    creds = Credentials.from_authorized_user_file(str(path))
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
@@ -106,7 +110,7 @@ def token_status(slug: str) -> dict:
             "detail": f"Never authorized. Run: google-workspace-authorize {slug}",
         }
     try:
-        creds = Credentials.from_authorized_user_file(str(path), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(path))  # granted scopes; see _load_credentials
     except (ValueError, OSError) as e:
         return {
             "authorized": False,
@@ -131,6 +135,17 @@ def token_status(slug: str) -> dict:
             "detail": f"Could not reach Google to check this token ({e}).",
         }
     path.write_text(creds.to_json())
+    missing = [s for s in SCOPES if s not in (creds.scopes or SCOPES)]
+    if missing:
+        return {
+            "authorized": True,
+            "status": "missing_scopes",
+            "missing_scopes": missing,
+            "detail": (
+                "Works, but was authorized before these scopes were added; the tools "
+                f"that need them will fail. Re-run: google-workspace-authorize {slug}"
+            ),
+        }
     return {"authorized": True, "status": "ok"}
 
 
@@ -152,6 +167,10 @@ def calendar(slug: str):
 
 def drive(slug: str):
     return _service(slug, "drive", "v3")
+
+
+def docs(slug: str):
+    return _service(slug, "docs", "v1")
 
 
 def tasks(slug: str):

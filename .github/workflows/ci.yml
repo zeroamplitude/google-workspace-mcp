@@ -97,7 +97,7 @@ jobs:
               failed = True
 
           claims = {
-              "the 'tools across five services' bullet": r"\*\*(\d+) tools across five services\*\*",
+              "the 'tools across N services' bullet": r"\*\*(\d+) tools across \w+ services\*\*",
               "the repository-layout comment": r"the MCP server . all (\d+) tools",
           }
           for where, pattern in claims.items():

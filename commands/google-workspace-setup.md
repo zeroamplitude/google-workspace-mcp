@@ -14,7 +14,7 @@ to paste secrets into chat — only to place files or click Allow.
 - OAuth client secret at `~/.config/google-workspace-mcp/credentials.json`
   (honor `$GWM_HOME` / `$GWM_CREDENTIALS` / `$XDG_CONFIG_HOME`). If missing,
   walk them through Google Cloud Console (own project; enable **Gmail**,
-  **Calendar**, **Drive**, **Tasks** APIs; OAuth consent screen / Google
+  **Calendar**, **Drive**, **Docs**, **Tasks** APIs; OAuth consent screen / Google
   Auth Platform audience **External**; create an **OAuth client → Desktop
   app**; download and save to that path).
 - **Publishing status — verify this even when `credentials.json` already
