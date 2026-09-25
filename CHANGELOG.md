@@ -10,6 +10,27 @@ only when it is bumped.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-25
+
+### Added
+
+- `docs_create(template_id, replacements)`: copy a template Doc and replace
+  its placeholders, reporting how many of each were replaced.
+- `docs_get` returns headers, footers and footnotes (`[^N]` in Markdown),
+  renders smart chips (person, date, link) instead of dropping them, reports
+  `has_pending_suggestions`, and takes `suggestions_view_mode`
+  (`inline`/`accepted`/`original`).
+- `docs_table_edit` actions: `merge_cells`, `unmerge_cells`, `style_cell`
+  (background colour), `pin_header_rows`, `set_column_width`,
+  `set_row_height`.
+- Markdown markers `<!-- pagebreak -->`, `<!-- sectionbreak -->` and
+  `<!-- sectionbreak continuous -->`.
+- New tools: `docs_header_footer`, `docs_footnote`, `docs_insert_chip`,
+  `docs_image` (list/replace/delete, inline or positioned), `docs_page_setup`
+  (page size, orientation, margins, page colour, section columns),
+  `docs_tab`, `docs_named_range`, `drive_comment_create`,
+  `drive_revision_list`, `drive_revision_get`.
+
 ## [0.14.0] - 2026-09-25
 
 ### Added
