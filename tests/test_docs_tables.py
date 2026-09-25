@@ -291,3 +291,94 @@ def test_no_fold_when_the_gap_follows_another_table(monkeypatch):
     svc.get_calls = 0
     server.docs_insert("personal", "doc-1", "| x |\n|---|", at="index", index=t0_end)
     assert not any("deleteContentRange" in r for b in svc.batches() for r in b["requests"])
+
+
+# ─── docs_table_edit: merge/unmerge, style, pin header rows, column width ─
+
+
+def test_table_edit_merge_cells(table_fake):
+    server.docs_table_edit("personal", "doc-1", 0, "merge_cells", row=0, column=0, row_span=2, column_span=2)
+    assert table_fake.sent["requests"] == [{"mergeTableCells": {"tableRange": {
+        "tableCellLocation": {"tableStartLocation": {"index": 6, "tabId": "t.0"}, "rowIndex": 0, "columnIndex": 0},
+        "rowSpan": 2,
+        "columnSpan": 2,
+    }}}]
+
+
+def test_table_edit_unmerge_cells(table_fake):
+    server.docs_table_edit("personal", "doc-1", 0, "unmerge_cells", row=0, column=0, row_span=1, column_span=2)
+    assert table_fake.sent["requests"] == [{"unmergeTableCells": {"tableRange": {
+        "tableCellLocation": {"tableStartLocation": {"index": 6, "tabId": "t.0"}, "rowIndex": 0, "columnIndex": 0},
+        "rowSpan": 1,
+        "columnSpan": 2,
+    }}}]
+
+
+def test_table_edit_merge_cells_validates_the_span(table_fake):
+    with pytest.raises(ValueError, match="row_span must keep"):
+        server.docs_table_edit("personal", "doc-1", 0, "merge_cells", row=1, column=0, row_span=2)
+    with pytest.raises(ValueError, match="column_span must keep"):
+        server.docs_table_edit("personal", "doc-1", 0, "merge_cells", row=0, column=1, column_span=2)
+
+
+def test_table_edit_style_cell_sets_background_color(table_fake):
+    server.docs_table_edit("personal", "doc-1", 0, "style_cell", row=0, column=1, background_color="#1a73e8")
+    assert table_fake.sent["requests"] == [{"updateTableCellStyle": {
+        "tableRange": {
+            "tableCellLocation": {"tableStartLocation": {"index": 6, "tabId": "t.0"}, "rowIndex": 0, "columnIndex": 1},
+            "rowSpan": 1,
+            "columnSpan": 1,
+        },
+        "tableCellStyle": {"backgroundColor": server._rgb("#1a73e8")},
+        "fields": "backgroundColor",
+    }}]
+
+
+def test_table_edit_style_cell_over_a_range(table_fake):
+    server.docs_table_edit(
+        "personal", "doc-1", 0, "style_cell", row=0, column=0, row_span=2, column_span=2, background_color="#e33",
+    )
+    rng = table_fake.sent["requests"][0]["updateTableCellStyle"]["tableRange"]
+    assert (rng["rowSpan"], rng["columnSpan"]) == (2, 2)
+
+
+def test_table_edit_style_cell_needs_background_color(table_fake):
+    with pytest.raises(ValueError, match="needs `background_color`"):
+        server.docs_table_edit("personal", "doc-1", 0, "style_cell", row=0, column=0)
+
+
+def test_table_edit_pin_header_rows(table_fake):
+    server.docs_table_edit("personal", "doc-1", 0, "pin_header_rows", count=1)
+    assert table_fake.sent["requests"] == [{"pinTableHeaderRows": {
+        "tableStartLocation": {"index": 6, "tabId": "t.0"},
+        "pinnedHeaderRowsCount": 1,
+    }}]
+
+
+def test_table_edit_pin_header_rows_can_unpin_with_zero(table_fake):
+    server.docs_table_edit("personal", "doc-1", 0, "pin_header_rows", count=0)
+    assert table_fake.sent["requests"][0]["pinTableHeaderRows"]["pinnedHeaderRowsCount"] == 0
+
+
+def test_table_edit_pin_header_rows_needs_a_count(table_fake):
+    with pytest.raises(ValueError, match="needs a non-negative `count`"):
+        server.docs_table_edit("personal", "doc-1", 0, "pin_header_rows")
+    with pytest.raises(ValueError, match="needs a non-negative `count`"):
+        server.docs_table_edit("personal", "doc-1", 0, "pin_header_rows", count=-1)
+
+
+def test_table_edit_set_column_width(table_fake):
+    server.docs_table_edit("personal", "doc-1", 0, "set_column_width", column=1, width_pt=120)
+    assert table_fake.sent["requests"] == [{"updateTableColumnProperties": {
+        "tableStartLocation": {"index": 6, "tabId": "t.0"},
+        "columnIndices": [1],
+        "tableColumnProperties": {"width": {"magnitude": 120, "unit": "PT"}, "widthType": "FIXED_WIDTH"},
+        "fields": "width,widthType",
+    }}]
+
+
+def test_table_edit_set_column_width_needs_a_positive_width(table_fake):
+    with pytest.raises(ValueError, match="needs a positive `width_pt`"):
+        server.docs_table_edit("personal", "doc-1", 0, "set_column_width", column=0)
+    with pytest.raises(ValueError, match="needs a positive `width_pt`"):
+        server.docs_table_edit("personal", "doc-1", 0, "set_column_width", column=0, width_pt=0)

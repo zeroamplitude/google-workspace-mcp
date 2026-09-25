@@ -46,6 +46,9 @@ def flatten_tabs(doc: dict) -> list[dict]:
                 "depth": depth,
                 "body": doc_tab.get("body", {}),
                 "lists": doc_tab.get("lists", {}),
+                "style": doc_tab.get("documentStyle", {}),
+                "headers": doc_tab.get("headers", {}),
+                "footers": doc_tab.get("footers", {}),
             })
             walk(t.get("childTabs", []), depth + 1)
 
@@ -54,6 +57,9 @@ def flatten_tabs(doc: dict) -> list[dict]:
         out.append({
             "tab_id": None, "title": None, "depth": 0,
             "body": doc.get("body", {}), "lists": doc.get("lists", {}),
+            "style": doc.get("documentStyle", {}),
+            "headers": doc.get("headers", {}),
+            "footers": doc.get("footers", {}),
         })
     return out
 
