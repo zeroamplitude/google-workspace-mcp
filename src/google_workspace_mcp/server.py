@@ -22,7 +22,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from mcp.server.fastmcp import FastMCP
 
-from . import auth, docs_markdown, docs_model
+from . import auth, docs_markdown, docs_model, docs_to_markdown
 from .accounts import ACCOUNTS, AccountSlug, email_for, name_for
 
 mcp = FastMCP("google-workspace")
@@ -1561,21 +1561,66 @@ def _insert_index(body: dict, at: str, heading: str | None, index: int | None) -
 
 
 @mcp.tool()
+def docs_create(
+    account: AccountSlug,
+    title: str,
+    markdown: str | None = None,
+    folder_id: str | None = None,
+) -> dict:
+    """Create a new Google Doc, optionally filled with Markdown.
+
+    Creates an empty doc via Drive (so `folder_id` places it in one call,
+    instead of create-then-move) and, if `markdown` is given, inserts it into
+    the new doc's empty body. Markdown support is as for docs_insert.
+    Returns `document_id`, `title`, `url`, and — when markdown was inserted —
+    the batchUpdate result (`revision_id`, `requests_applied`, `replies`).
+    """
+    metadata: dict[str, Any] = {"name": title, "mimeType": "application/vnd.google-apps.document"}
+    if folder_id:
+        metadata["parents"] = [folder_id]
+    file = (
+        auth.drive(account)
+        .files()
+        .create(body=metadata, fields="id, name, webViewLink", supportsAllDrives=True)
+        .execute()
+    )
+    document_id = file["id"]
+    out = {"document_id": document_id, "title": file.get("name"), "url": file.get("webViewLink")}
+    if markdown:
+        _, tab, revision = _docs_load(account, document_id, None, None)
+        body = tab["body"]
+        idx = _insert_index(body, "end", None, None)
+        mode = docs_model.insertion_mode(body, idx)
+        reqs = docs_markdown.markdown_to_requests(markdown, idx, mode, tab["tab_id"])
+        out.update(_docs_batch(account, document_id, reqs, revision))
+    return out
+
+
+@mcp.tool()
 def docs_get(
     account: AccountSlug,
     document_id: str,
     tab_id: str | None = None,
     include_paragraphs: bool = False,
+    format: Literal["text", "markdown"] = "text",
 ) -> dict:
     """Read a Google Doc for editing: its text, tabs, and heading outline.
 
     Returns `revision_id` (pass it to the edit tools so they refuse to write
-    over a newer version), `tabs`, the chosen tab's `text`, and `outline` —
-    every heading with its `level` (0 = Title, 1-6), `start_index`,
-    `body_start_index` and `end_index` (the section's extent, subsections
-    included). `include_paragraphs` adds every top-level paragraph with its
-    index range, for exact edits with docs_delete_range / docs_insert(index=).
-    Indices are per tab; without `tab_id` the first tab is used.
+    over a newer version), `tabs`, and `outline` — every heading with its
+    `level` (0 = Title, 1-6), `start_index`, `body_start_index` and
+    `end_index` (the section's extent, subsections included).
+    `include_paragraphs` adds every top-level paragraph with its index range,
+    for exact edits with docs_delete_range / docs_insert(index=). Indices are
+    per tab; without `tab_id` the first tab is used.
+
+    `format="markdown"` returns the tab's content as `markdown` instead of
+    `text`, in the same Markdown subset docs_insert / docs_replace_section
+    write (headings, bold/italic/code/links, lists, quotes; tables, images
+    and strikethrough render too, though they won't round-trip through a
+    write). Prefer it when about to rewrite a section with docs_replace_section
+    or docs_insert — plain `text` flattens formatting, so a rewrite built from
+    it would silently lose bold/links/lists.
     """
     doc, tab, revision = _docs_load(account, document_id, tab_id, None)
     body = tab["body"]
@@ -1590,8 +1635,11 @@ def docs_get(
         ],
         "body_end_index": docs_model.body_end(body),
         "outline": [s.as_dict() for s in docs_model.outline(body)],
-        "text": docs_model.plain_text(body),
     }
+    if format == "markdown":
+        out["markdown"] = docs_to_markdown.body_to_markdown(body, tab.get("lists", {}))
+    else:
+        out["text"] = docs_model.plain_text(body)
     if include_paragraphs:
         out["paragraphs"] = docs_model.paragraphs(body)
     return out

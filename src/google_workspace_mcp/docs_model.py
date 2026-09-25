@@ -39,17 +39,22 @@ def flatten_tabs(doc: dict) -> list[dict]:
     def walk(tabs: list[dict], depth: int) -> None:
         for t in tabs:
             props = t.get("tabProperties", {})
+            doc_tab = t.get("documentTab", {})
             out.append({
                 "tab_id": props.get("tabId"),
                 "title": props.get("title"),
                 "depth": depth,
-                "body": t.get("documentTab", {}).get("body", {}),
+                "body": doc_tab.get("body", {}),
+                "lists": doc_tab.get("lists", {}),
             })
             walk(t.get("childTabs", []), depth + 1)
 
     walk(doc.get("tabs", []), 0)
     if not out:  # fetched without includeTabsContent: one implicit tab
-        out.append({"tab_id": None, "title": None, "depth": 0, "body": doc.get("body", {})})
+        out.append({
+            "tab_id": None, "title": None, "depth": 0,
+            "body": doc.get("body", {}), "lists": doc.get("lists", {}),
+        })
     return out
 
 
