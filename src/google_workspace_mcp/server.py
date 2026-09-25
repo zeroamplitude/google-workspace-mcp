@@ -12,6 +12,8 @@ import base64
 import io
 import mimetypes
 import re
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from email.message import EmailMessage
 from email.utils import formataddr, parseaddr, parsedate_to_datetime
 from html import escape, unescape
@@ -2199,6 +2201,37 @@ _IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif"}
 _IMAGE_CAP = 50 * 1024 * 1024
 
 
+@contextmanager
+def _temp_drive_image(account: str, local_path: str):
+    """Upload a local image to Drive, temporarily link-readable, yielding a
+    URL Docs can fetch it from — then revoke access and trash the upload,
+    even if the caller's own request fails. The document ends up holding
+    its own copy of the image either way."""
+    path = _local_file(local_path)
+    mime, _ = mimetypes.guess_type(str(path))
+    if mime not in _IMAGE_TYPES:
+        raise ValueError(f"Docs takes PNG, JPEG or GIF images; {path.name} is {mime or 'unknown'}.")
+    if path.stat().st_size > _IMAGE_CAP:
+        raise ValueError(f"{path.name} is over Docs' 50 MB image limit.")
+    files = auth.drive(account).files()
+    perms = auth.drive(account).permissions()
+    up = files.create(
+        body={"name": f"(temporary image for a Doc) {path.name}"},
+        media_body=MediaFileUpload(str(path), mimetype=mime),
+        fields="id",
+    ).execute()
+    try:
+        perms.create(fileId=up["id"], body={"type": "anyone", "role": "reader"}).execute()
+        yield f"https://drive.usercontent.google.com/download?id={up['id']}&export=download"
+    finally:
+        # The document now holds its own copy; don't leave the upload exposed.
+        try:
+            perms.delete(fileId=up["id"], permissionId="anyoneWithLink").execute()
+        except HttpError:
+            pass  # never shared (the create above failed); trashing still follows
+        files.update(fileId=up["id"], body={"trashed": True}).execute()
+
+
 @mcp.tool()
 def docs_insert_image(
     account: AccountSlug,
@@ -2275,31 +2308,193 @@ def docs_insert_image(
     if image_url:
         out = insert(image_url)
     else:
-        path = _local_file(local_path)
-        mime, _ = mimetypes.guess_type(str(path))
-        if mime not in _IMAGE_TYPES:
-            raise ValueError(f"Docs takes PNG, JPEG or GIF images; {path.name} is {mime or 'unknown'}.")
-        if path.stat().st_size > _IMAGE_CAP:
-            raise ValueError(f"{path.name} is over Docs' 50 MB image limit.")
-        files = auth.drive(account).files()
-        perms = auth.drive(account).permissions()
-        up = files.create(
-            body={"name": f"(temporary image for a Doc) {path.name}"},
-            media_body=MediaFileUpload(str(path), mimetype=mime),
-            fields="id",
-        ).execute()
-        try:
-            perms.create(fileId=up["id"], body={"type": "anyone", "role": "reader"}).execute()
-            out = insert(f"https://drive.usercontent.google.com/download?id={up['id']}&export=download")
-        finally:
-            # The document now holds its own copy; don't leave the upload exposed.
-            try:
-                perms.delete(fileId=up["id"], permissionId="anyoneWithLink").execute()
-            except HttpError:
-                pass  # never shared (the create above failed); trashing still follows
-            files.update(fileId=up["id"], body={"trashed": True}).execute()
+        with _temp_drive_image(account, local_path) as uri:
+            out = insert(uri)
     reply = next((r["insertInlineImage"] for r in out["replies"] if r.get("insertInlineImage")), {})
     return {"inserted_at": img_at, "object_id": reply.get("objectId"), **out}
+
+
+_DATE_FORMATS = (
+    "DATE_FORMAT_MONTH_DAY_ABBREVIATED", "DATE_FORMAT_MONTH_DAY_FULL",
+    "DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED", "DATE_FORMAT_ISO8601",
+)
+
+
+def _chip_timestamp(date: str) -> str:
+    """A caller's ISO date ("2026-09-25") or datetime ("2026-09-25T10:00:00Z")
+    -> the RFC 3339 UTC timestamp insertDate's dateElementProperties wants.
+    A date/datetime with no timezone is treated as UTC."""
+    try:
+        dt = datetime.fromisoformat(date)
+    except ValueError as e:
+        raise ValueError(f"`date` must be an ISO date or datetime, got {date!r}.") from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+@mcp.tool()
+def docs_insert_chip(
+    account: AccountSlug,
+    document_id: str,
+    kind: Literal["person", "date", "link"],
+    email: str | None = None,
+    date: str | None = None,
+    date_format: Literal[_DATE_FORMATS] | None = None,
+    url: str | None = None,
+    at: Literal["end", "start", "after_heading", "index"] = "end",
+    heading: str | None = None,
+    index: int | None = None,
+    after_text: str | None = None,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Insert a "smart chip" into a Google Doc, in place: an @-mention of a
+    person, a date, or a rich link to a Google Drive/Workspace item.
+
+    `kind="person"` needs `email` (insertPerson) — Docs renders it as an
+    @-mention, resolving the display name itself when the address is known
+    to the account (a contact, or another collaborator).
+
+    `kind="date"` needs `date`, an ISO date ("2026-09-25") or datetime
+    ("2026-09-25T10:00:00Z"); a value with no timezone is treated as UTC
+    (insertDate). `date_format` picks how it's displayed — one of
+    DATE_FORMAT_MONTH_DAY_ABBREVIATED, DATE_FORMAT_MONTH_DAY_FULL,
+    DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED, DATE_FORMAT_ISO8601 — left unset,
+    Docs uses the viewer's own locale format.
+
+    `kind="link"` needs `url` (insertRichLink). Google only turns a Google
+    Drive/Workspace URL — a Doc, Sheet, Slide, Drive file, Calendar event and
+    the like — into a rich link chip; any other URL is refused by the API.
+    For a plain hyperlink to an arbitrary page, use docs_insert's Markdown
+    `[text](url)` instead.
+
+    Placement: `after_text` places the chip right after the first
+    occurrence of that quoted text (whitespace-tolerant, as for
+    docs_footnote); otherwise as for docs_insert (`at="end"` / `"start"` /
+    `"after_heading"` + `heading` / `"index"` + `index`).
+    """
+    if kind == "person":
+        if not email:
+            raise ValueError('kind="person" needs `email`.')
+        req_key, props = "insertPerson", {"personProperties": {"email": email}}
+    elif kind == "date":
+        if not date:
+            raise ValueError('kind="date" needs `date`.')
+        date_props: dict[str, Any] = {"timestamp": _chip_timestamp(date)}
+        if date_format:
+            date_props["dateFormat"] = date_format
+        req_key, props = "insertDate", {"dateElementProperties": date_props}
+    else:
+        if not url:
+            raise ValueError('kind="link" needs `url`.')
+        req_key, props = "insertRichLink", {"richLinkProperties": {"uri": url}}
+
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    loc_tab = tab["tab_id"]
+
+    if after_text:
+        at_idx = docs_model.locate_quote(body, after_text)
+        if at_idx is None:
+            raise ValueError(f"{after_text!r} does not appear in this tab.")
+        idx = at_idx + docs_model.utf16_len(after_text)
+    else:
+        idx = _insert_index(body, at, heading, index)
+
+    loc = {"index": idx, **({"tabId": loc_tab} if loc_tab else {})}
+    req = {req_key: {**props, "location": loc}}
+    out = _docs_batch(account, document_id, [req], revision)
+    return {"kind": kind, "inserted_at": idx, **out}
+
+
+@mcp.tool()
+def docs_image(
+    account: AccountSlug,
+    document_id: str,
+    action: Literal["list", "replace", "delete"],
+    object_id: str | None = None,
+    image_url: str | None = None,
+    local_path: str | None = None,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """List, replace, or delete an image already in a Google Doc's tab.
+
+    `action="list"` returns every image in the tab: inline (anchored in the
+    text flow — `object_id` is what docs_insert_image returns) and
+    positioned (floating, anchored to a paragraph but outside the text
+    flow) — each as `{object_id, kind, width_pt, height_pt, content_uri,
+    source_uri}`. `content_uri` is a short-lived Google-hosted copy;
+    `source_uri` is the original the image was inserted from, when Docs
+    kept a record of it.
+
+    `action="replace"` needs `object_id` (from "list") plus `image_url` or
+    `local_path`, exactly as docs_insert_image — swaps its picture in place
+    (CENTER_CROP to fill the existing frame), keeping size and position.
+
+    `action="delete"` needs `object_id`: an inline image is removed from the
+    text that holds it; a positioned image is detached from its anchor.
+    """
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    loc_tab = tab["tab_id"]
+    inline_objs = tab.get("inline_objects", {})
+    pos_objs = tab.get("positioned_objects", {})
+
+    if action == "list":
+        def row(oid: str, obj: dict, prop_key: str, kind: str) -> dict:
+            embedded = (obj.get(prop_key, {}) or {}).get("embeddedObject", {}) or {}
+            img = embedded.get("imageProperties", {}) or {}
+            size = embedded.get("size", {}) or {}
+            return {
+                "object_id": oid,
+                "kind": kind,
+                "width_pt": (size.get("width") or {}).get("magnitude"),
+                "height_pt": (size.get("height") or {}).get("magnitude"),
+                "content_uri": img.get("contentUri"),
+                "source_uri": img.get("sourceUri"),
+            }
+        images = [row(oid, obj, "inlineObjectProperties", "inline") for oid, obj in inline_objs.items()]
+        images += [row(oid, obj, "positionedObjectProperties", "positioned") for oid, obj in pos_objs.items()]
+        return {"images": images}
+
+    if not object_id:
+        raise ValueError(f'action={action!r} needs `object_id`.')
+
+    if action == "replace":
+        if (image_url is None) == (local_path is None):
+            raise ValueError("Pass exactly one of image_url or local_path.")
+
+        def req(uri: str) -> dict:
+            return {"replaceImage": {
+                "imageObjectId": object_id,
+                "uri": uri,
+                "imageReplaceMethod": "CENTER_CROP",
+                **({"tabId": loc_tab} if loc_tab else {}),
+            }}
+
+        if image_url:
+            out = _docs_batch(account, document_id, [req(image_url)], revision)
+        else:
+            with _temp_drive_image(account, local_path) as uri:
+                out = _docs_batch(account, document_id, [req(uri)], revision)
+        return {"action": action, "object_id": object_id, **out}
+
+    # action == "delete"
+    if object_id in inline_objs:
+        found = docs_model.find_inline_object(body.get("content", []), object_id)
+        if found is None:
+            raise ValueError(f"{object_id!r} is a known inline image, but isn't placed in this tab's body.")
+        start, end = found
+        rng = {"startIndex": start, "endIndex": end, **({"tabId": loc_tab} if loc_tab else {})}
+        req = {"deleteContentRange": {"range": rng}}
+    elif object_id in pos_objs:
+        req = {"deletePositionedObject": {"objectId": object_id, **({"tabId": loc_tab} if loc_tab else {})}}
+    else:
+        raise ValueError(f"No image {object_id!r} in this tab.")
+    out = _docs_batch(account, document_id, [req], revision)
+    return {"action": action, "object_id": object_id, **out}
 
 
 _TABLE_ACTIONS = (
