@@ -11,6 +11,12 @@ it, so all ranges are computed against the post-insert document. The one
 exception is createParagraphBullets, which strips the leading tabs that set
 nesting levels and so shifts later indices — those requests go last, in
 reverse document order, where no later range depends on them.
+
+GitHub-style pipe tables aren't part of that single insert: `insertTable`
+is its own API call that has to be re-fetched to find the table it made
+before cells can be filled, so `split_markdown_tables` below pulls table
+blocks out of the Markdown for server.py to insert separately, in sequence
+with the surrounding text.
 """
 
 from __future__ import annotations
@@ -154,6 +160,76 @@ def parse_blocks(md: str) -> list[Para]:
         i += 1
     flush()
     return paras
+
+
+# ─── tables ─────────────────────────────────────────────────────────────
+
+_ROW = re.compile(r"^[ \t]*\|(.*)\|[ \t]*$")
+_SEP_CELL = re.compile(r"^:?-+:?$")
+
+
+def _split_row(line: str) -> list[str]:
+    """A `| a | b |` line's cells, `\\|` treated as a literal pipe."""
+    inner = _ROW.match(line).group(1)
+    cells: list[str] = []
+    buf = ""
+    i = 0
+    while i < len(inner):
+        if inner[i] == "\\" and i + 1 < len(inner) and inner[i + 1] == "|":
+            buf += "|"
+            i += 2
+        elif inner[i] == "|":
+            cells.append(buf.strip())
+            buf = ""
+            i += 1
+        else:
+            buf += inner[i]
+            i += 1
+    cells.append(buf.strip())
+    return cells
+
+
+def split_markdown_tables(md: str) -> list[tuple[str, object]]:
+    """Split `md` into ("text", str) and ("table", rows) segments, in order.
+
+    A table is a GitHub-style pipe table: a `| a | b |` header row, a
+    `|---|---|` separator row of the same width (each cell just dashes,
+    optionally `:`-anchored), then zero or more further rows. `rows[0]` is
+    the header; data rows are padded/truncated to the header's width.
+    """
+    lines = md.replace("\r\n", "\n").split("\n")
+    segments: list[tuple[str, object]] = []
+    text_buf: list[str] = []
+
+    def flush() -> None:
+        if text_buf:
+            segments.append(("text", "\n".join(text_buf)))
+            text_buf.clear()
+
+    i, n = 0, len(lines)
+    while i < n:
+        header = _ROW.match(lines[i])
+        sep = _ROW.match(lines[i + 1]) if i + 1 < n else None
+        if header and sep:
+            head_cells = _split_row(lines[i])
+            sep_cells = _split_row(lines[i + 1])
+            if len(sep_cells) == len(head_cells) and all(_SEP_CELL.match(c) for c in sep_cells):
+                flush()
+                width = len(head_cells)
+                rows = [head_cells]
+                j = i + 2
+                while j < n and _ROW.match(lines[j]):
+                    cells = _split_row(lines[j])
+                    cells = (cells + [""] * width)[:width]
+                    rows.append(cells)
+                    j += 1
+                segments.append(("table", rows))
+                i = j
+                continue
+        text_buf.append(lines[i])
+        i += 1
+    flush()
+    return segments
 
 
 # ─── requests ───────────────────────────────────────────────────────────

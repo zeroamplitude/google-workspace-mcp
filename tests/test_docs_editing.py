@@ -123,12 +123,28 @@ def test_replace_empty_last_section(monkeypatch):
     assert reqs[0]["insertText"] == {"text": "\nbody", "location": {"index": 7, "tabId": "t.0"}}
 
 
-def test_replace_section_refuses_to_delete_a_table(monkeypatch):
+def test_replace_section_may_delete_a_table(monkeypatch):
     svc = _FakeDocs(make_doc(("HEADING_1", "Data"), ("table", [["a"]]), ("HEADING_1", "Next")))
     monkeypatch.setattr(server.auth, "docs", lambda account: svc)
-    with pytest.raises(ValueError, match="contains a table"):
+    out = server.docs_replace_section("personal", "doc-1", "Data", "gone")
+    reqs = svc.sent["requests"]
+    assert reqs[0] == {"deleteContentRange": {"range": {"startIndex": 6, "endIndex": 12, "tabId": "t.0"}}}
+    assert reqs[1]["insertText"] == {"text": "gone\n", "location": {"index": 6, "tabId": "t.0"}}
+    assert out["replaced_range"] == [6, 12]
+    assert [n for n, _ in svc.log] == ["get", "batchUpdate"]  # no table in the new markdown: one batch, as before
+
+
+def test_replace_section_still_refuses_a_section_break(monkeypatch):
+    body = make_body(("HEADING_1", "Data"), ("NORMAL_TEXT", "x"), ("HEADING_1", "Next"))
+    # Splice a sectionBreak into the section, the way structural_in_range looks for one.
+    body["content"].insert(2, {"startIndex": 6, "endIndex": 7, "sectionBreak": {}})
+    svc = _FakeDocs({
+        "documentId": "doc-1", "title": "Doc", "revisionId": "rev-1",
+        "tabs": [{"tabProperties": {"tabId": "t.0", "title": "T.0"}, "documentTab": {"body": body}}],
+    })
+    monkeypatch.setattr(server.auth, "docs", lambda account: svc)
+    with pytest.raises(ValueError, match="contains a sectionBreak"):
         server.docs_replace_section("personal", "doc-1", "Data", "gone")
-    assert [n for n, _ in svc.log] == ["get"]
 
 
 def test_edits_address_the_requested_tab(monkeypatch):
