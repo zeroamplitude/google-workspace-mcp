@@ -2554,6 +2554,181 @@ def docs_footnote(
     return {"footnote_id": footnote_id, "inserted_at": idx, **out2}
 
 
+@mcp.tool()
+def docs_tab(
+    account: AccountSlug,
+    document_id: str,
+    action: Literal["add", "delete", "rename"],
+    title: str | None = None,
+    tab_id: str | None = None,
+    parent_tab_id: str | None = None,
+    index: int | None = None,
+    icon_emoji: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Add, delete, or rename a tab of a Google Doc.
+
+    `action="add"` creates a new, empty tab: `title` names it, `parent_tab_id`
+    nests it under an existing tab (omitted makes it a root-level tab),
+    `index` places it among its new siblings (0-based; omitted appends it),
+    and `icon_emoji` sets its tab icon. Returns the new tab's `tab_id` — use
+    that with docs_insert / docs_replace_section / etc.'s `tab_id` to fill it.
+
+    `action="delete"` needs `tab_id`; it removes that tab and any child tabs
+    it has.
+
+    `action="rename"` needs `tab_id` and `title`.
+    """
+    if action == "add":
+        _, _, revision = _docs_load(account, document_id, None, revision_id)
+        props: dict[str, Any] = {}
+        if title:
+            props["title"] = title
+        if parent_tab_id:
+            props["parentTabId"] = parent_tab_id
+        if index is not None:
+            props["index"] = index
+        if icon_emoji:
+            props["iconEmoji"] = icon_emoji
+        req = {"addDocumentTab": {"tabProperties": props}}
+        out = _docs_batch(account, document_id, [req], revision)
+        new_tab_id = next(
+            (r["addDocumentTab"]["tabProperties"].get("tabId") for r in out["replies"] if r.get("addDocumentTab")),
+            None,
+        )
+        return {"action": action, "tab_id": new_tab_id, **out}
+
+    if not tab_id:
+        raise ValueError(f'action={action!r} needs `tab_id`.')
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+
+    if action == "delete":
+        req = {"deleteTab": {"tabId": tab["tab_id"]}}
+        return {"action": action, "tab_id": tab["tab_id"], **_docs_batch(account, document_id, [req], revision)}
+
+    if not title:
+        raise ValueError('action="rename" needs `title`.')
+    req = {"updateDocumentTabProperties": {
+        "tabProperties": {"tabId": tab["tab_id"], "title": title},
+        "fields": "title",
+    }}
+    return {"action": action, "tab_id": tab["tab_id"], **_docs_batch(account, document_id, [req], revision)}
+
+
+def _segment_content(tab: dict, segment_id: str | None) -> dict:
+    """The body, or the header/footer/footnote segment `segment_id` belongs
+    to (same {"content": [...]} shape either way)."""
+    if not segment_id:
+        return tab["body"]
+    for m in ("headers", "footers", "footnotes"):
+        seg = tab.get(m, {}).get(segment_id)
+        if seg is not None:
+            return seg
+    return tab["body"]
+
+
+@mcp.tool()
+def docs_named_range(
+    account: AccountSlug,
+    document_id: str,
+    action: Literal["create", "delete", "replace", "list"],
+    name: str | None = None,
+    named_range_id: str | None = None,
+    text: str | None = None,
+    start_index: int | None = None,
+    end_index: int | None = None,
+    tab_id: str | None = None,
+    revision_id: str | None = None,
+) -> dict:
+    """Create, delete, replace the content of, or list the named ranges of a
+    Google Doc — a label attached to a span of text that other tools/scripts
+    can look up later (see action="list").
+
+    `action="create"` needs `name`, plus the span to name: either `text`
+    (the range is the first occurrence of this quoted text, whitespace-
+    tolerant, like docs_footnote's `after_text`) or explicit `start_index` /
+    `end_index`. Returns the new `named_range_id`.
+
+    `action="delete"` needs `named_range_id` or `name` (deletes every named
+    range with that name).
+
+    `action="replace"` needs `text` (its new content) plus `named_range_id`
+    or `name` (every named range with that name is replaced). Only plain
+    text is supported here — the Docs API's replaceNamedRangeContent takes
+    unstyled text, so any Markdown syntax in `text` is stripped rather than
+    rendered.
+
+    `action="list"` returns every named range in the tab: `name`,
+    `named_range_id`, and each range's `start_index` / `end_index` / current
+    `text`.
+
+    `tab_id` selects the tab (default: the document's first). For
+    "delete" / "replace" with a `name` that exists in more than one tab, an
+    explicit `tab_id` scopes the change to that tab only; omitted, it applies
+    everywhere the name is found.
+    """
+    _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
+    body = tab["body"]
+    loc_tab = tab["tab_id"]
+
+    if action == "list":
+        out = []
+        for rng_name, group in (tab.get("named_ranges") or {}).items():
+            for nr in group.get("namedRanges", []):
+                ranges = []
+                for r in nr.get("ranges", []):
+                    seg = _segment_content(tab, r.get("segmentId"))
+                    ranges.append({
+                        "start_index": r["startIndex"],
+                        "end_index": r["endIndex"],
+                        "text": docs_model.text_in_range(seg, r["startIndex"], r["endIndex"]),
+                    })
+                out.append({"name": nr.get("name", rng_name), "named_range_id": nr["namedRangeId"], "ranges": ranges})
+        return {"named_ranges": out}
+
+    if action == "create":
+        if not name:
+            raise ValueError('action="create" needs `name`.')
+        if text:
+            start = docs_model.locate_quote(body, text)
+            if start is None:
+                raise ValueError(f"{text!r} does not appear in this tab.")
+            end = start + docs_model.utf16_len(text)
+        elif start_index is not None and end_index is not None:
+            if end_index <= start_index:
+                raise ValueError("end_index must be greater than start_index.")
+            start, end = start_index, end_index
+        else:
+            raise ValueError('action="create" needs `text` (to locate a quoted range) or `start_index`/`end_index`.')
+        rng = {"startIndex": start, "endIndex": end, **({"tabId": loc_tab} if loc_tab else {})}
+        req = {"createNamedRange": {"name": name, "range": rng}}
+        out = _docs_batch(account, document_id, [req], revision)
+        named_range_id = next(r["createNamedRange"]["namedRangeId"] for r in out["replies"] if r.get("createNamedRange"))
+        return {"action": action, "name": name, "named_range_id": named_range_id,
+                "start_index": start, "end_index": end, **out}
+
+    if not named_range_id and not name:
+        raise ValueError(f'action={action!r} needs `named_range_id` or `name`.')
+
+    if action == "delete":
+        req_body: dict[str, Any] = {"namedRangeId": named_range_id} if named_range_id else {"name": name}
+        if tab_id:
+            req_body["tabsCriteria"] = {"tabIds": [tab_id]}
+        req = {"deleteNamedRange": req_body}
+        return {"action": action, **_docs_batch(account, document_id, [req], revision)}
+
+    # action == "replace"
+    if not text:
+        raise ValueError('action="replace" needs `text`.')
+    plain = "".join(t for t, _ in docs_markdown.parse_inline(text))
+    req_body = {"namedRangeId": named_range_id} if named_range_id else {"namedRangeName": name}
+    req_body["text"] = plain
+    if tab_id:
+        req_body["tabsCriteria"] = {"tabIds": [tab_id]}
+    req = {"replaceNamedRangeContent": req_body}
+    return {"action": action, **_docs_batch(account, document_id, [req], revision)}
+
+
 # ─── Tasks (Google Tasks) ────────────────────────────────────────────────
 
 

@@ -50,6 +50,7 @@ def flatten_tabs(doc: dict) -> list[dict]:
                 "headers": doc_tab.get("headers", {}),
                 "footers": doc_tab.get("footers", {}),
                 "footnotes": doc_tab.get("footnotes", {}),
+                "named_ranges": doc_tab.get("namedRanges", {}),
             })
             walk(t.get("childTabs", []), depth + 1)
 
@@ -62,6 +63,7 @@ def flatten_tabs(doc: dict) -> list[dict]:
             "headers": doc.get("headers", {}),
             "footers": doc.get("footers", {}),
             "footnotes": doc.get("footnotes", {}),
+            "named_ranges": doc.get("namedRanges", {}),
         })
     return out
 
@@ -245,6 +247,13 @@ def locate_quote(body: dict, quote: str) -> int | None:
     hay = "".join(squashed).casefold()
     pos = hay.find(" ".join(words).casefold())
     return None if pos < 0 else squashed_at[pos]
+
+
+def text_in_range(body: dict, start: int, end: int) -> str:
+    """Plain text of `body` (or a header/footer/footnote segment, same shape)
+    within [start, end)."""
+    chars, where = _char_map(body)
+    return "".join(ch for ch, at in zip(chars, where) if start <= at < end)
 
 
 def find_all(body: dict, needle: str, match_case: bool = True) -> list[tuple[int, int]]:
