@@ -5,10 +5,12 @@ The point is a stable read -> edit -> write round trip: `docs_get(format=
 can re-ingest without losing structure. So this sticks to exactly the subset
 `docs_markdown` supports (see its module docstring) wherever the two need to
 agree — headings, bold/italic/code/links, bulleted/numbered lists (nested by
-two-space indent), and indented paragraphs as `> ` quotes. Tables, images and
-strikethrough don't round-trip through `docs_markdown` (it has no writer for
-them); they're still rendered, as a GitHub pipe table, `![image](id)`, and
-`~~text~~` respectively, for a human or Claude to read.
+two-space indent), and indented paragraphs as `> ` quotes. Tables, images,
+strikethrough and footnotes don't round-trip through `docs_markdown` (it has
+no writer for them); they're still rendered, as a GitHub pipe table,
+`![image](id)`, `~~text~~`, and a `[^N]` reference plus a trailing `[^N]:
+text` definition (see `footnotes_markdown`) respectively, for a human or
+Claude to read.
 
 Every Doc paragraph becomes its own block, blank-line separated, except runs
 of consecutive list items (kept one-per-line) since `docs_markdown` matches
@@ -19,6 +21,8 @@ type would merge with its neighbour without one.
 from __future__ import annotations
 
 import re
+
+from google_workspace_mcp import docs_model
 
 _MONO_FONTS = {"Roboto Mono", "Courier New", "Consolas", "Source Code Pro"}
 _ESCAPE_RE = re.compile(r"([\\*_`])")
@@ -70,8 +74,9 @@ def _render_run(text: str, key: tuple) -> str:
 
 
 def _raw_runs(elements: list[dict]) -> list[list]:
-    """[text, style, is_image] per element, with the paragraph's trailing
-    newline stripped off the last text run."""
+    """[text, style, is_literal] per element, with the paragraph's trailing
+    newline stripped off the last text run. `is_literal` marks a segment
+    (an image or a footnote reference) that's inserted as-is, unstyled."""
     out: list[list] = []
     for e in elements:
         if "textRun" in e:
@@ -79,7 +84,10 @@ def _raw_runs(elements: list[dict]) -> list[list]:
         elif "inlineObjectElement" in e:
             oid = e["inlineObjectElement"].get("inlineObjectId", "")
             out.append([f"![image]({oid})", {}, True])
-        # horizontalRule, footnoteReference, columnBreak, ... : skipped
+        elif "footnoteReference" in e:
+            number = e["footnoteReference"].get("footnoteNumber", "")
+            out.append([f"[^{number}]", {}, True])
+        # horizontalRule, columnBreak, ... : skipped
     if out and not out[-1][2] and out[-1][0].endswith("\n"):
         out[-1][0] = out[-1][0][:-1]
     return out
@@ -96,8 +104,8 @@ def _para_inline_md(elements: list[dict]) -> str:
             segments.append(_render_run(buf_text, buf_key))
         buf_text, buf_key = "", None
 
-    for text, style, is_image in _raw_runs(elements):
-        if is_image:
+    for text, style, is_literal in _raw_runs(elements):
+        if is_literal:
             flush()
             segments.append(text)
             continue
@@ -211,3 +219,22 @@ def body_to_markdown(body: dict, lists: dict) -> str:
             out.append("\n\n" + text)
         prev_list = is_list
     return "".join(out)
+
+
+def footnotes_markdown(body: dict, footnotes: dict, lists: dict) -> str:
+    """`\\n\\n[^N]: text` for every footnote `body` references, in reference
+    order — appended after `body_to_markdown`'s output to close out the
+    `[^N]` markers it rendered inline. `footnotes` is `tab.documentTab.
+    footnotes` (footnoteId -> footnote, each with its own `content`); a
+    footnote's content becomes one line, its own paragraph breaks collapsed
+    to spaces. Empty string when `body` has no footnote references."""
+    seen: dict[str, str] = {}
+    for footnote_id, number in docs_model.footnote_references(body.get("content", [])):
+        seen.setdefault(footnote_id, number)
+    if not seen:
+        return ""
+    lines = []
+    for footnote_id, number in seen.items():
+        text = " ".join(body_to_markdown(footnotes.get(footnote_id, {}), lists).split())
+        lines.append(f"[^{number}]: {text}")
+    return "\n\n" + "\n".join(lines)

@@ -106,3 +106,54 @@ def test_find_all_returns_utf16_ranges():
     assert m.find_all(body, "ab") == [(4, 6), (10, 12)]
     assert len(m.find_all(body, "ab", match_case=False)) == 3
     assert m.find_all(body, "") == []
+
+
+def test_flatten_tabs_includes_headers_footers_footnotes():
+    doc = {"tabs": [{
+        "tabProperties": {"tabId": "a", "title": "A"},
+        "documentTab": {
+            "body": {"content": []},
+            "headers": {"h1": {"content": []}},
+            "footers": {"f1": {"content": []}},
+            "footnotes": {"fn1": {"content": []}},
+        },
+    }]}
+    t = m.flatten_tabs(doc)[0]
+    assert t["headers"] == {"h1": {"content": []}}
+    assert t["footers"] == {"f1": {"content": []}}
+    assert t["footnotes"] == {"fn1": {"content": []}}
+
+    untabbed = m.flatten_tabs({
+        "body": {"content": []}, "headers": {"h2": {"content": []}}, "footers": {}, "footnotes": {},
+    })[0]
+    assert untabbed["headers"] == {"h2": {"content": []}}
+
+
+_FOOTNOTE_ELEMENTS = [
+    {"textRun": {"content": "Hello "}},
+    {"footnoteReference": {"footnoteId": "fn1", "footnoteNumber": "1"}},
+    {"textRun": {"content": " world\n"}},
+]
+
+
+def test_footnote_references_in_reading_order():
+    content = [{"paragraph": {"elements": _FOOTNOTE_ELEMENTS}}]
+    assert m.footnote_references(content) == [("fn1", "1")]
+
+
+def test_footnote_references_searches_tables():
+    content = [{"table": {"tableRows": [{"tableCells": [
+        {"content": [{"paragraph": {"elements": _FOOTNOTE_ELEMENTS}}]},
+    ]}]}}]
+    assert m.footnote_references(content) == [("fn1", "1")]
+
+
+def test_plain_text_with_footnotes_renders_bracket_markers():
+    content = [{"paragraph": {"elements": _FOOTNOTE_ELEMENTS}}]
+    assert m.plain_text_with_footnotes(content) == "Hello [1] world\n"
+
+
+def test_has_pending_suggestions_finds_nested_keys():
+    assert m.has_pending_suggestions({"a": {"b": [{"suggestedInsertionIds": ["s1"]}]}})
+    assert m.has_pending_suggestions({"a": [{"suggestedDeletionIds": ["s1"]}]})
+    assert not m.has_pending_suggestions({"a": {"b": [1, "text", {"c": True}]}})

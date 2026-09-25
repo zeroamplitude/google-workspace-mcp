@@ -5,7 +5,7 @@ from __future__ import annotations
 from docbuilder import make_body
 
 from google_workspace_mcp.docs_markdown import parse_blocks
-from google_workspace_mcp.docs_to_markdown import body_to_markdown
+from google_workspace_mcp.docs_to_markdown import body_to_markdown, footnotes_markdown
 
 BULLETS = {
     "list1": {"listProperties": {"nestingLevels": [
@@ -198,3 +198,38 @@ def test_round_trip_recovers_paragraph_styles_and_list_kinds():
         ("NORMAL_TEXT", "number", 0, False),
         ("NORMAL_TEXT", None, 0, True),
     ]
+
+
+def _footnote_para(*elements):
+    """A one-paragraph body from raw elements — for footnoteReference, which
+    docbuilder's make_body has no shorthand for."""
+    return {"content": [{"paragraph": {"elements": list(elements), "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"}}}]}
+
+
+def test_footnote_reference_renders_as_caret_marker():
+    body = _footnote_para(
+        {"textRun": {"content": "See"}},
+        {"footnoteReference": {"footnoteId": "fn1", "footnoteNumber": "1"}},
+        {"textRun": {"content": " this.\n"}},
+    )
+    assert body_to_markdown(body, {}) == "See[^1] this."
+
+
+def test_footnotes_markdown_appends_definitions_in_reference_order():
+    body = _footnote_para(
+        {"textRun": {"content": "a"}},
+        {"footnoteReference": {"footnoteId": "fn2", "footnoteNumber": "2"}},
+        {"footnoteReference": {"footnoteId": "fn1", "footnoteNumber": "1"}},
+        {"textRun": {"content": "\n"}},
+    )
+    footnotes = {
+        "fn1": _footnote_para({"textRun": {"content": "First note.\n"}}),
+        "fn2": _footnote_para({"textRun": {"content": "Second note.\n"}}),
+    }
+    # Reference order (fn2 then fn1), not numeric order.
+    assert footnotes_markdown(body, footnotes, {}) == "\n\n[^2]: Second note.\n[^1]: First note."
+
+
+def test_footnotes_markdown_empty_without_references():
+    body = make_body(("NORMAL_TEXT", "plain"))
+    assert footnotes_markdown(body, {}, {}) == ""
