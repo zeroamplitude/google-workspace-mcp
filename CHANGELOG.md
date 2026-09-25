@@ -31,6 +31,14 @@ only when it is bumped.
   `docs_tab`, `docs_named_range`, `drive_comment_create`,
   `drive_revision_list`, `drive_revision_get`.
 
+### Fixed (found testing live, before release)
+
+- `docs_named_range` replace/delete failed in a document with more than one
+  tab: unscoped, Google applies them to every tab. They are now scoped to the
+  target tab.
+- `docs_page_setup(column_count=…)` without `column_spacing_pt` was rejected
+  by Google; spacing now defaults to 36pt.
+
 ## [0.14.0] - 2026-09-25
 
 ### Added

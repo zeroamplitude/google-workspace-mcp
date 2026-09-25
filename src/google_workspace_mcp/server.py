@@ -2851,7 +2851,7 @@ def docs_page_setup(
     section, and gains another per `<!-- sectionbreak -->` in docs_insert)
     to style that section instead, via updateSectionStyle: the same
     `margin_*_pt` params, plus `column_count` (1-3) — with
-    `column_spacing_pt` for the gap between columns — for a multi-column
+    `column_spacing_pt` for the gap between columns (default 36) — for a multi-column
     layout. `preset` / `width_pt` / `height_pt` / `orientation` /
     `background_color` are document-wide only; pass those without
     `section_index`.
@@ -2870,7 +2870,8 @@ def docs_page_setup(
         if column_count is not None:
             if not 1 <= column_count <= 3:
                 raise ValueError(f"column_count must be 1-3, got {column_count}.")
-            col: dict[str, Any] = {"paddingEnd": _dim(column_spacing_pt)} if column_spacing_pt is not None else {}
+            # Google rejects columnProperties without padding; 36pt is Docs' own two-column default.
+            col = {"paddingEnd": _dim(36.0 if column_spacing_pt is None else column_spacing_pt)}
             style["columnProperties"] = [dict(col) for _ in range(column_count)]
             fields.append("columnProperties")
         if not fields:
@@ -3065,10 +3066,8 @@ def docs_named_range(
     `named_range_id`, and each range's `start_index` / `end_index` / current
     `text`.
 
-    `tab_id` selects the tab (default: the document's first). For
-    "delete" / "replace" with a `name` that exists in more than one tab, an
-    explicit `tab_id` scopes the change to that tab only; omitted, it applies
-    everywhere the name is found.
+    `tab_id` selects the tab (default: the document's first); "delete" and
+    "replace" only touch named ranges in that tab.
     """
     _, tab, revision = _docs_load(account, document_id, tab_id, revision_id)
     body = tab["body"]
@@ -3115,8 +3114,8 @@ def docs_named_range(
 
     if action == "delete":
         req_body: dict[str, Any] = {"namedRangeId": named_range_id} if named_range_id else {"name": name}
-        if tab_id:
-            req_body["tabsCriteria"] = {"tabIds": [tab_id]}
+        if loc_tab:  # unscoped, Google applies it to every tab and fails on tabs without the range
+            req_body["tabsCriteria"] = {"tabIds": [loc_tab]}
         req = {"deleteNamedRange": req_body}
         return {"action": action, **_docs_batch(account, document_id, [req], revision)}
 
@@ -3126,8 +3125,8 @@ def docs_named_range(
     plain = "".join(t for t, _ in docs_markdown.parse_inline(text))
     req_body = {"namedRangeId": named_range_id} if named_range_id else {"namedRangeName": name}
     req_body["text"] = plain
-    if tab_id:
-        req_body["tabsCriteria"] = {"tabIds": [tab_id]}
+    if loc_tab:
+        req_body["tabsCriteria"] = {"tabIds": [loc_tab]}
     req = {"replaceNamedRangeContent": req_body}
     return {"action": action, **_docs_batch(account, document_id, [req], revision)}
 

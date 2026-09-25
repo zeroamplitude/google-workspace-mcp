@@ -134,7 +134,9 @@ def test_delete_needs_id_or_name(fake):
 
 def test_delete_by_id(fake):
     server.docs_named_range("personal", "doc-1", "delete", named_range_id="nr-1")
-    assert fake.sent["requests"] == [{"deleteNamedRange": {"namedRangeId": "nr-1"}}]
+    assert fake.sent["requests"] == [{"deleteNamedRange": {
+        "namedRangeId": "nr-1", "tabsCriteria": {"tabIds": ["t.0"]},
+    }}]
 
 
 def test_delete_by_name_scoped_to_a_tab(fake):
@@ -152,14 +154,14 @@ def test_replace_needs_text(fake):
 def test_replace_strips_markdown_to_plain_text(fake):
     server.docs_named_range("personal", "doc-1", "replace", named_range_id="nr-1", text="**bold** word")
     assert fake.sent["requests"] == [{"replaceNamedRangeContent": {
-        "namedRangeId": "nr-1", "text": "bold word",
+        "namedRangeId": "nr-1", "text": "bold word", "tabsCriteria": {"tabIds": ["t.0"]},
     }}]
 
 
 def test_replace_by_name(fake):
     server.docs_named_range("personal", "doc-1", "replace", name="greeting", text="Hi")
     assert fake.sent["requests"] == [{"replaceNamedRangeContent": {
-        "namedRangeName": "greeting", "text": "Hi",
+        "namedRangeName": "greeting", "text": "Hi", "tabsCriteria": {"tabIds": ["t.0"]},
     }}]
 
 

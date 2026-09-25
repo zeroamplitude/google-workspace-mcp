@@ -117,7 +117,7 @@ def test_page_setup_section_margins_and_columns(fake):
 def test_page_setup_section_column_count_without_spacing(fake):
     server.docs_page_setup("personal", "doc-1", section_index=0, column_count=3)
     req = fake.sent["requests"][0]["updateSectionStyle"]
-    assert req["sectionStyle"]["columnProperties"] == [{}, {}, {}]
+    assert req["sectionStyle"]["columnProperties"] == [{"paddingEnd": {"magnitude": 36.0, "unit": "PT"}}] * 3
 
 
 def test_page_setup_unknown_section_index_raises(fake):
